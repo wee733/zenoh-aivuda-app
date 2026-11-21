@@ -57,14 +57,25 @@ properties:
         type: integer
         minimum: -1
         maximum: 232
-        default: -1
-        description: "ROS_DOMAIN_ID (-1 inherits host environment default)."
+        description: "Legacy 2.1 ROS domain; used only when zenoh.ros_domain_id is absent."
         need_restart: true
     required:
       - distro
       - setup_script
       - discovery_range
-      - domain_id
+    additionalProperties: false
+  zenoh:
+    type: object
+    properties:
+      ros_domain_id:
+        type: integer
+        minimum: -1
+        maximum: 232
+        default: -1
+        description: "ROS_DOMAIN_ID for the bridge. When present, even -1 overrides legacy ros.domain_id; -1 inherits ROS_DOMAIN_ID from the environment (0 if unset)."
+        need_restart: true
+    required:
+      - ros_domain_id
     additionalProperties: false
 required:
   - sys

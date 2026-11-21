@@ -21,19 +21,31 @@
 
 namespace zenoh_bridge {
 
+// Immutable inputs read under the owner lock before rclcpp::init. The node
+// never reopens these files or selects a different policy after DDS starts.
+struct StartupConfig {
+  std::string runtime_path, settings_path, shield_script;
+  nlohmann::json runtime = nlohmann::json::object();
+  nlohmann::json persisted = nlohmann::json::object();
+  BridgeSettings shield_policy;
+  nlohmann::json shield_status;
+  std::string shield_error;
+  int domain_id{0};
+};
+
 class ZenohBridgeNode : public rclcpp::Node {
 public:
-  explicit ZenohBridgeNode(const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
+  ZenohBridgeNode(const StartupConfig &startup, const rclcpp::NodeOptions &options);
   ~ZenohBridgeNode() override;
 
   RuleSet getCurrentRules() const;
   bool applyRules(const RuleSet &new_rules, bool persist_to_file, std::string &out_msg);
-  AgentStatus buildStatusSnapshot() const;
 
 private:
   struct ActiveEgress {
     EgressRule rule;
     std::string rel_topic;
+    std::string agent_id;  // Identity used to declare this rule's Zenoh publisher.
     std::string local_topic;
     std::string resolved_type;
     std::atomic<uint64_t> binding_generation{0};
@@ -66,6 +78,7 @@ private:
 
   struct ActiveIngress {
     IngressRule rule;
+    std::string agent_id, domain_prefix;  // Identity of this subscription generation.
     std::string zenoh_pattern;
     std::optional<zenoh::Subscriber<void>> z_sub;
 
@@ -92,19 +105,41 @@ private:
     std::string kind;
   };
 
-  void loadRuntimeConfigFile();
+  // Published as one immutable generation so callbacks can read settings and
+  // inspect the matching session without taking locks used during reconnect.
+  struct RuntimeConfig {
+    BridgeSettings bridge;
+    std::string agent_id;
+    SessionConfig session;
+    nlohmann::json effective;
+    std::shared_ptr<zenoh::Session> active_session;
+  };
+  std::shared_ptr<const RuntimeConfig> configSnapshot() const {
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    return config_;
+  }
+  void publishConfig(RuntimeConfig next);
+  void loadStartupConfig(RuntimeConfig &config, const StartupConfig &startup);
   zenoh::Config buildZenohConfig(const SessionConfig &sc, std::string &out_effective_json) const;
-  void initZenohSession();
+  void initZenohSession(RuntimeConfig next);
   void teardownZenohSession();
   bool reconnectSession(const SessionConfig &new_cfg, bool persist, std::string &out_msg);
-  bool updateBridgeSettings(const BridgeSettings &new_settings, bool persist, std::string &out_msg);
+  // Returns the HTTP-equivalent status. Only a local authenticated request can
+  // authorize a change of shield policy (or explicitly reconcile it).
+  int updateBridgeSettings(const nlohmann::json &patch, bool persist, bool shield_admin,
+                           std::string &out_msg, bool reconcile_shield = false,
+                           const nlohmann::json &expected_policy = nullptr);
   void loadInitialRules();
-  std::shared_ptr<ActiveIngress> makeIngress(const IngressRule &rule, bool initially_active = true);
+  std::shared_ptr<ActiveIngress> makeIngress(const IngressRule &rule, const RuntimeConfig &config);
   std::string localIngressTopic(const IngressRule &rule, const std::string &source,
                                 const std::string &topic) const;
   void attachEgressRosSubscriptions();
   void onDiscoveryTimer();
   void onStatusTimer();
+  RuleSet snapshotRulesLocked() const;
+  static void readSessionIds(const std::shared_ptr<zenoh::Session> &session, AgentStatus &status);
+  AgentStatus buildStatusSnapshot(const RuntimeConfig &config) const;
+  bool reconnectSessionLocked(RuntimeConfig next, bool persist, std::string &out_msg);
 
   void handleRosMessage(const std::shared_ptr<ActiveEgress> &eg,
                         const std::shared_ptr<const rclcpp::SerializedMessage> &msg,
@@ -117,6 +152,17 @@ private:
   // Local Zenoh info snapshot (including Transports & Links)
   nlohmann::json buildLocalZenohInfoJson() const;
 
+  // Built-in DDS Shield (non-lo DDS anti-leak firewall)
+  bool runDdsShieldAction(const std::string &action,
+                          std::string &out_msg,
+                          const std::string &scope,
+                          const std::string &domains,
+                          BridgeSettings *installed = nullptr);
+  nlohmann::json refreshDdsShieldStatus();
+  void pollDdsShieldStatus();
+  std::string resolveShieldDomains(const std::string &configured_domains) const;
+  nlohmann::json buildLocalDdsShieldJson() const;
+
   // Remote RPC via Zenoh Queryable
   nlohmann::json queryRemoteAgent(const std::string &target_agent_id,
                                   const nlohmann::json &request_body,
@@ -126,9 +172,9 @@ private:
   HttpResponse handleHttpRequest(const HttpRequest &req);
   nlohmann::json handleZenohPutApi(const nlohmann::json &body);
   nlohmann::json handleZenohDeleteApi(const nlohmann::json &body);
-  nlohmann::json handleZenohGetApi(const nlohmann::json &body);
+  nlohmann::json handleZenohGetApi(const nlohmann::json &body, uint64_t timeout_ms);
   nlohmann::json handleZenohScoutApi(const nlohmann::json &body);
-  nlohmann::json handleLivelinessGetApi(const nlohmann::json &body);
+  nlohmann::json handleLivelinessGetApi(const nlohmann::json &body, uint64_t timeout_ms);
   nlohmann::json handleLivelinessDeclareApi(const nlohmann::json &body);
   nlohmann::json handleLivelinessUndeclareApi(const nlohmann::json &body);
   nlohmann::json handleSniffStartApi(const nlohmann::json &body);
@@ -154,33 +200,39 @@ private:
                                  double max_kbps);
   static int64_t nowSteadyNs();
   static int64_t nowEpochMs();
-  static std::string formatPreview(const std::vector<uint8_t> &bytes, size_t max_len = 256);
+  static std::string formatPreview(const zenoh::Bytes &payload, size_t max_len = 256);
 
   // Identity & configuration
   std::string default_agent_id_{"uav1"};
-  std::string agent_id_;
   std::string robot_type_;
   std::string hostname_;
-  std::string domain_prefix_;
   std::string ros_distro_;
-  std::string runtime_config_file_;
   std::string session_override_file_;
   std::string bridge_settings_file_;
   std::string rules_file_;
-  std::string default_preset_;
+  std::string dds_shield_script_;
+  int ros_domain_id_{-1};
   std::string api_bind_host_{"127.0.0.1"};
   int api_port_{17447};
-  bool allow_unprefixed_local_{true};
-  bool liveliness_enabled_{true};
   int64_t started_epoch_ms_{0};
 
-  BridgeSettings bridge_settings_;
-  SessionConfig session_cfg_;
-  std::string effective_zenoh_config_json_;
+  rclcpp::CallbackGroup::SharedPtr shield_callback_group_;
+  rclcpp::TimerBase::SharedPtr shield_timer_;
+  // DDS Shield cached telemetry
+  mutable std::mutex dds_shield_mutex_;
+  bool dds_shield_active_{false};
+  uint64_t dds_shield_rx_dropped_{0};
+  uint64_t dds_shield_tx_dropped_{0};
+  std::string dds_shield_error_;
+  int64_t last_shield_poll_ns_{0};
+
+  mutable std::mutex config_mutex_;
+  std::shared_ptr<const RuntimeConfig> config_;
+  // Only configuration writers take this lock, never inline Zenoh callbacks.
+  std::mutex reconfigure_mutex_;
 
   // Zenoh runtime
   mutable std::mutex session_mutex_;
-  std::optional<zenoh::Session> session_;
   std::optional<zenoh::Queryable<void>> ctrl_queryable_;
   std::optional<zenoh::Publisher> status_pub_;
   std::optional<zenoh::Subscriber<void>> swarm_status_sub_;
@@ -207,8 +259,6 @@ private:
   // Live log ring buffer
   mutable std::mutex log_mutex_;
   std::deque<LogEntry> log_buffer_;
-  std::string last_log_msg_;
-  int64_t last_log_ms_{0};
   uint64_t warn_count_{0};
   uint64_t error_count_{0};
 
@@ -230,7 +280,6 @@ private:
   rclcpp::TimerBase::SharedPtr discovery_timer_;
   rclcpp::TimerBase::SharedPtr status_timer_;
   MiniHttpServer http_server_;
-  std::atomic<bool> shutting_down_{false};
 };
 
 }  // namespace zenoh_bridge

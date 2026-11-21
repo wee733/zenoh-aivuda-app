@@ -2,9 +2,15 @@
 #define ZENOH_BRIDGE_PROTOCOL_HPP
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
 #include <fstream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -23,6 +29,9 @@ struct BridgeSettings {
   std::string default_preset{"empty"};      // empty | formation | uxrce_swarm | vision_debug | low_bandwidth
   bool allow_unprefixed_local{true};        // match both /<agent_id>/<topic> and /<topic>
   bool liveliness_enabled{true};            // auto-declare <prefix>/alive/<agent_id> token
+  bool dds_shield_enabled{false};           // opt-in: block non-lo DDS for selected domain(s) or all
+  std::string dds_shield_scope{"domain"};   // domain (targeted RTPS ports only) | all (all DDS multicast + domains)
+  std::string dds_shield_domains;           // comma-separated domain IDs (empty -> current ROS_DOMAIN_ID / 0)
 };
 
 struct SessionConfig {
@@ -224,6 +233,13 @@ struct AgentStatus {
   double total_rx_kbps{0.0};
   uint64_t warn_count{0};
   uint64_t error_count{0};
+  bool dds_shield_enabled{false};
+  bool dds_shield_active{false};
+  std::string dds_shield_scope{"domain"};
+  std::string dds_shield_domains;
+  uint64_t dds_shield_rx_dropped{0};
+  uint64_t dds_shield_tx_dropped{0};
+  std::string dds_shield_error;
   std::vector<LocalTopicInfo> local_topics;
   std::vector<EgressRule> egress;
   std::vector<IngressRule> ingress;
@@ -363,16 +379,65 @@ inline void to_json(nlohmann::json &j, const BridgeSettings &b) {
       {"default_preset", b.default_preset},
       {"allow_unprefixed_local", b.allow_unprefixed_local},
       {"liveliness_enabled", b.liveliness_enabled},
+      {"dds_shield_enabled", b.dds_shield_enabled},
+      {"dds_shield_scope", b.dds_shield_scope},
+      {"dds_shield_domains", b.dds_shield_domains},
   };
 }
 
+// An empty list inherits the ROS domain. Otherwise require decimal CSV: never
+// silently drop malformed tokens or translate an invalid policy to domain zero.
+inline std::string normalizeShieldDomains(const std::string &raw) {
+  const auto first = raw.find_first_not_of(" \t");
+  if (first == std::string::npos) return {};
+  std::set<unsigned> domains;
+  for (size_t begin = 0;;) {
+    const auto comma = raw.find(',', begin);
+    const auto token = raw.substr(begin, comma == std::string::npos ? comma : comma - begin);
+    const auto start = token.find_first_not_of(" \t");
+    const auto end = token.find_last_not_of(" \t");
+    if (start == std::string::npos) throw std::invalid_argument("Empty DDS Shield domain in list");
+    if (end - start >= 3 || token.find_first_not_of("0123456789", start) <= end)
+      throw std::invalid_argument("DDS Shield domains must be comma-separated decimal IDs in [0,232]");
+    const auto id = std::stoul(token.substr(start, end - start + 1));
+    if (id > 232) throw std::invalid_argument("DDS Shield domain exceeds 232");
+    domains.insert(static_cast<unsigned>(id));
+    if (comma == std::string::npos) break;
+    begin = comma + 1;
+  }
+  std::string normalized;
+  for (unsigned id : domains) {
+    if (!normalized.empty()) normalized += ',';
+    normalized += std::to_string(id);
+  }
+  return normalized;
+}
+
+inline void normalizeShieldPolicy(BridgeSettings &b) {
+  if (b.dds_shield_scope != "domain" && b.dds_shield_scope != "all")
+    throw std::invalid_argument("DDS Shield scope must be 'domain' or 'all'");
+  b.dds_shield_domains = normalizeShieldDomains(b.dds_shield_domains);
+}
+
 inline void from_json(const nlohmann::json &j, BridgeSettings &b) {
-  b.agent_id = trimSlashes(j.value("agent_id", ""));
-  b.domain_prefix = trimSlashes(j.value("domain_prefix", std::string(kDefaultDomainPrefix)));
-  if (b.domain_prefix.empty()) b.domain_prefix = kDefaultDomainPrefix;
-  b.default_preset = j.value("default_preset", "empty");
-  b.allow_unprefixed_local = j.value("allow_unprefixed_local", true);
-  b.liveliness_enabled = j.value("liveliness_enabled", true);
+  static const BridgeSettings defaults;
+  b.agent_id = trimSlashes(j.value("agent_id", defaults.agent_id));
+  b.domain_prefix = trimSlashes(j.value("domain_prefix", defaults.domain_prefix));
+  if (b.domain_prefix.empty()) b.domain_prefix = defaults.domain_prefix;
+  b.default_preset = j.value("default_preset", defaults.default_preset);
+  b.allow_unprefixed_local = j.value("allow_unprefixed_local", defaults.allow_unprefixed_local);
+  b.liveliness_enabled = j.value("liveliness_enabled", defaults.liveliness_enabled);
+  b.dds_shield_enabled = j.value("dds_shield_enabled", defaults.dds_shield_enabled);
+  b.dds_shield_scope = j.value("dds_shield_scope", defaults.dds_shield_scope);
+  b.dds_shield_domains = j.value("dds_shield_domains", defaults.dds_shield_domains);
+  normalizeShieldPolicy(b);
+}
+
+inline BridgeSettings mergedBridgeSettings(const BridgeSettings &base, const nlohmann::json &patch) {
+  if (!patch.is_object()) throw std::invalid_argument("bridge_settings must be an object");
+  nlohmann::json merged = base;
+  merged.update(patch);  // Preserve absent fields; explicit null is a type error, not a reset.
+  return merged.get<BridgeSettings>();
 }
 
 inline void to_json(nlohmann::json &j, const SessionConfig &c) {
@@ -460,89 +525,90 @@ inline void to_json(nlohmann::json &j, const SessionConfig &c) {
 }
 
 inline void from_json(const nlohmann::json &j, SessionConfig &c) {
-  c.config_mode = j.value("config_mode", "structured");
-  c.raw_json5 = j.value("raw_json5", "");
-  c.custom_zid = j.value("custom_zid", "");
-  c.zenoh_namespace = j.value("zenoh_namespace", "");
-  c.metadata_json5 = j.value("metadata_json5", "");
-  c.mode = j.value("mode", "peer");
+  static const SessionConfig defaults;
+  c.config_mode = j.value("config_mode", defaults.config_mode);
+  c.raw_json5 = j.value("raw_json5", defaults.raw_json5);
+  c.custom_zid = j.value("custom_zid", defaults.custom_zid);
+  c.zenoh_namespace = j.value("zenoh_namespace", defaults.zenoh_namespace);
+  c.metadata_json5 = j.value("metadata_json5", defaults.metadata_json5);
+  c.mode = j.value("mode", defaults.mode);
   if (j.contains("connect_endpoints") && j["connect_endpoints"].is_array()) {
     c.connect_endpoints = j["connect_endpoints"].get<std::vector<std::string>>();
   }
-  c.connect_timeout_ms = j.value("connect_timeout_ms", 0);
-  c.connect_exit_on_failure = j.value("connect_exit_on_failure", false);
+  c.connect_timeout_ms = j.value("connect_timeout_ms", defaults.connect_timeout_ms);
+  c.connect_exit_on_failure = j.value("connect_exit_on_failure", defaults.connect_exit_on_failure);
   if (j.contains("listen_endpoints") && j["listen_endpoints"].is_array()) {
     c.listen_endpoints = j["listen_endpoints"].get<std::vector<std::string>>();
   }
-  c.listen_timeout_ms = j.value("listen_timeout_ms", 0);
-  c.listen_exit_on_failure = j.value("listen_exit_on_failure", false);
-  c.queries_default_timeout_ms = j.value("queries_default_timeout_ms", 10000);
-  c.scouting_timeout_ms = j.value("scouting_timeout_ms", 3000);
-  c.scouting_delay_ms = j.value("scouting_delay_ms", 500);
-  c.multicast_enabled = j.value("multicast_enabled", true);
-  c.multicast_address = j.value("multicast_address", "224.0.0.224:7446");
-  c.multicast_interface = j.value("multicast_interface", "auto");
-  c.multicast_ttl = j.value("multicast_ttl", 1);
-  c.multicast_listen = j.value("multicast_listen", true);
-  c.gossip_enabled = j.value("gossip_enabled", true);
-  c.gossip_multihop = j.value("gossip_multihop", false);
-  c.unicast_lowlatency = j.value("unicast_lowlatency", false);
-  c.unicast_qos_enabled = j.value("unicast_qos_enabled", true);
-  c.compression_enabled = j.value("compression_enabled", false);
-  c.unicast_max_sessions = j.value("unicast_max_sessions", 1000);
-  c.unicast_max_links = j.value("unicast_max_links", 1);
-  c.unicast_open_timeout = j.value("unicast_open_timeout", 10000);
-  c.unicast_accept_timeout = j.value("unicast_accept_timeout", 10000);
-  c.multicast_qos_enabled = j.value("multicast_qos_enabled", false);
-  c.multicast_compression_enabled = j.value("multicast_compression_enabled", false);
-  c.multicast_join_interval = j.value("multicast_join_interval", 2500);
-  c.lease_ms = j.value("lease_ms", 10000);
-  c.keep_alive = j.value("keep_alive", 4);
-  c.tx_batch_size = j.value("tx_batch_size", 65535);
-  c.tx_threads = j.value("tx_threads", 0);
-  c.batching_enabled = j.value("batching_enabled", true);
-  c.batching_time_limit_ms = j.value("batching_time_limit_ms", 1);
-  c.rx_buffer_size = j.value("rx_buffer_size", 65535);
-  c.rx_max_message_size = j.value("rx_max_message_size", 1073741824);
-  c.tcp_so_sndbuf = j.value("tcp_so_sndbuf", 0);
-  c.tcp_so_rcvbuf = j.value("tcp_so_rcvbuf", 0);
-  c.tx_queue_json5 = j.value("tx_queue_json5", "");
-  c.shared_memory_enabled = j.value("shared_memory_enabled", false);
-  c.shm_mode = j.value("shm_mode", "lazy");
-  c.shm_opt_enabled = j.value("shm_opt_enabled", true);
-  c.shm_pool_size = j.value("shm_pool_size", 16777216);
-  c.shm_message_threshold = j.value("shm_message_threshold", 3072);
-  c.timestamping_enabled = j.value("timestamping_enabled", false);
-  c.drop_future_timestamp = j.value("drop_future_timestamp", false);
-  c.tls_root_ca = j.value("tls_root_ca", "");
-  c.tls_listen_key = j.value("tls_listen_key", "");
-  c.tls_listen_cert = j.value("tls_listen_cert", "");
-  c.tls_enable_mtls = j.value("tls_enable_mtls", false);
-  c.tls_connect_key = j.value("tls_connect_key", "");
-  c.tls_connect_cert = j.value("tls_connect_cert", "");
-  c.tls_verify_name = j.value("tls_verify_name", true);
-  c.auth_user = j.value("auth_user", "");
-  c.auth_password = j.value("auth_password", "");
-  c.auth_dictionary_file = j.value("auth_dictionary_file", "");
-  c.auth_pubkey_file = j.value("auth_pubkey_file", "");
-  c.auth_privkey_file = j.value("auth_privkey_file", "");
-  c.auth_known_keys_file = j.value("auth_known_keys_file", "");
-  c.acl_enabled = j.value("acl_enabled", false);
-  c.acl_default_permission = j.value("acl_default_permission", "deny");
-  c.acl_json5 = j.value("acl_json5", "");
-  c.peers_failover_brokering = j.value("peers_failover_brokering", true);
-  c.peer_routing_mode = j.value("peer_routing_mode", "peer_to_peer");
-  c.adminspace_enabled = j.value("adminspace_enabled", false);
-  c.adminspace_read = j.value("adminspace_read", true);
-  c.adminspace_write = j.value("adminspace_write", false);
-  c.downsampling_json5 = j.value("downsampling_json5", "");
-  c.low_pass_filter_json5 = j.value("low_pass_filter_json5", "");
-  c.qos_publication_json5 = j.value("qos_publication_json5", "");
-  c.qos_network_json5 = j.value("qos_network_json5", "");
-  c.aggregation_json5 = j.value("aggregation_json5", "");
-  c.plugins_loading_enabled = j.value("plugins_loading_enabled", false);
-  c.plugins_json5 = j.value("plugins_json5", "");
-  c.custom_json5 = j.value("custom_json5", "");
+  c.listen_timeout_ms = j.value("listen_timeout_ms", defaults.listen_timeout_ms);
+  c.listen_exit_on_failure = j.value("listen_exit_on_failure", defaults.listen_exit_on_failure);
+  c.queries_default_timeout_ms = j.value("queries_default_timeout_ms", defaults.queries_default_timeout_ms);
+  c.scouting_timeout_ms = j.value("scouting_timeout_ms", defaults.scouting_timeout_ms);
+  c.scouting_delay_ms = j.value("scouting_delay_ms", defaults.scouting_delay_ms);
+  c.multicast_enabled = j.value("multicast_enabled", defaults.multicast_enabled);
+  c.multicast_address = j.value("multicast_address", defaults.multicast_address);
+  c.multicast_interface = j.value("multicast_interface", defaults.multicast_interface);
+  c.multicast_ttl = j.value("multicast_ttl", defaults.multicast_ttl);
+  c.multicast_listen = j.value("multicast_listen", defaults.multicast_listen);
+  c.gossip_enabled = j.value("gossip_enabled", defaults.gossip_enabled);
+  c.gossip_multihop = j.value("gossip_multihop", defaults.gossip_multihop);
+  c.unicast_lowlatency = j.value("unicast_lowlatency", defaults.unicast_lowlatency);
+  c.unicast_qos_enabled = j.value("unicast_qos_enabled", defaults.unicast_qos_enabled);
+  c.compression_enabled = j.value("compression_enabled", defaults.compression_enabled);
+  c.unicast_max_sessions = j.value("unicast_max_sessions", defaults.unicast_max_sessions);
+  c.unicast_max_links = j.value("unicast_max_links", defaults.unicast_max_links);
+  c.unicast_open_timeout = j.value("unicast_open_timeout", defaults.unicast_open_timeout);
+  c.unicast_accept_timeout = j.value("unicast_accept_timeout", defaults.unicast_accept_timeout);
+  c.multicast_qos_enabled = j.value("multicast_qos_enabled", defaults.multicast_qos_enabled);
+  c.multicast_compression_enabled = j.value("multicast_compression_enabled", defaults.multicast_compression_enabled);
+  c.multicast_join_interval = j.value("multicast_join_interval", defaults.multicast_join_interval);
+  c.lease_ms = j.value("lease_ms", defaults.lease_ms);
+  c.keep_alive = j.value("keep_alive", defaults.keep_alive);
+  c.tx_batch_size = j.value("tx_batch_size", defaults.tx_batch_size);
+  c.tx_threads = j.value("tx_threads", defaults.tx_threads);
+  c.batching_enabled = j.value("batching_enabled", defaults.batching_enabled);
+  c.batching_time_limit_ms = j.value("batching_time_limit_ms", defaults.batching_time_limit_ms);
+  c.rx_buffer_size = j.value("rx_buffer_size", defaults.rx_buffer_size);
+  c.rx_max_message_size = j.value("rx_max_message_size", defaults.rx_max_message_size);
+  c.tcp_so_sndbuf = j.value("tcp_so_sndbuf", defaults.tcp_so_sndbuf);
+  c.tcp_so_rcvbuf = j.value("tcp_so_rcvbuf", defaults.tcp_so_rcvbuf);
+  c.tx_queue_json5 = j.value("tx_queue_json5", defaults.tx_queue_json5);
+  c.shared_memory_enabled = j.value("shared_memory_enabled", defaults.shared_memory_enabled);
+  c.shm_mode = j.value("shm_mode", defaults.shm_mode);
+  c.shm_opt_enabled = j.value("shm_opt_enabled", defaults.shm_opt_enabled);
+  c.shm_pool_size = j.value("shm_pool_size", defaults.shm_pool_size);
+  c.shm_message_threshold = j.value("shm_message_threshold", defaults.shm_message_threshold);
+  c.timestamping_enabled = j.value("timestamping_enabled", defaults.timestamping_enabled);
+  c.drop_future_timestamp = j.value("drop_future_timestamp", defaults.drop_future_timestamp);
+  c.tls_root_ca = j.value("tls_root_ca", defaults.tls_root_ca);
+  c.tls_listen_key = j.value("tls_listen_key", defaults.tls_listen_key);
+  c.tls_listen_cert = j.value("tls_listen_cert", defaults.tls_listen_cert);
+  c.tls_enable_mtls = j.value("tls_enable_mtls", defaults.tls_enable_mtls);
+  c.tls_connect_key = j.value("tls_connect_key", defaults.tls_connect_key);
+  c.tls_connect_cert = j.value("tls_connect_cert", defaults.tls_connect_cert);
+  c.tls_verify_name = j.value("tls_verify_name", defaults.tls_verify_name);
+  c.auth_user = j.value("auth_user", defaults.auth_user);
+  c.auth_password = j.value("auth_password", defaults.auth_password);
+  c.auth_dictionary_file = j.value("auth_dictionary_file", defaults.auth_dictionary_file);
+  c.auth_pubkey_file = j.value("auth_pubkey_file", defaults.auth_pubkey_file);
+  c.auth_privkey_file = j.value("auth_privkey_file", defaults.auth_privkey_file);
+  c.auth_known_keys_file = j.value("auth_known_keys_file", defaults.auth_known_keys_file);
+  c.acl_enabled = j.value("acl_enabled", defaults.acl_enabled);
+  c.acl_default_permission = j.value("acl_default_permission", defaults.acl_default_permission);
+  c.acl_json5 = j.value("acl_json5", defaults.acl_json5);
+  c.peers_failover_brokering = j.value("peers_failover_brokering", defaults.peers_failover_brokering);
+  c.peer_routing_mode = j.value("peer_routing_mode", defaults.peer_routing_mode);
+  c.adminspace_enabled = j.value("adminspace_enabled", defaults.adminspace_enabled);
+  c.adminspace_read = j.value("adminspace_read", defaults.adminspace_read);
+  c.adminspace_write = j.value("adminspace_write", defaults.adminspace_write);
+  c.downsampling_json5 = j.value("downsampling_json5", defaults.downsampling_json5);
+  c.low_pass_filter_json5 = j.value("low_pass_filter_json5", defaults.low_pass_filter_json5);
+  c.qos_publication_json5 = j.value("qos_publication_json5", defaults.qos_publication_json5);
+  c.qos_network_json5 = j.value("qos_network_json5", defaults.qos_network_json5);
+  c.aggregation_json5 = j.value("aggregation_json5", defaults.aggregation_json5);
+  c.plugins_loading_enabled = j.value("plugins_loading_enabled", defaults.plugins_loading_enabled);
+  c.plugins_json5 = j.value("plugins_json5", defaults.plugins_json5);
+  c.custom_json5 = j.value("custom_json5", defaults.custom_json5);
 }
 
 inline void to_json(nlohmann::json &j, const EgressRule &r) {
@@ -645,12 +711,6 @@ inline void to_json(nlohmann::json &j, const LogEntry &e) {
   };
 }
 
-inline void from_json(const nlohmann::json &j, LogEntry &e) {
-  e.timestamp_ms = j.value("timestamp_ms", int64_t{0});
-  e.level = j.value("level", "INFO");
-  e.message = j.value("message", "");
-}
-
 inline void to_json(nlohmann::json &j, const LocalTopicInfo &t) {
   j = nlohmann::json{
       {"name", t.name},
@@ -714,6 +774,13 @@ inline void to_json(nlohmann::json &j, const AgentStatus &s) {
       {"total_rx_kbps", s.total_rx_kbps},
       {"warn_count", s.warn_count},
       {"error_count", s.error_count},
+      {"dds_shield_enabled", s.dds_shield_enabled},
+      {"dds_shield_active", s.dds_shield_active},
+      {"dds_shield_scope", s.dds_shield_scope},
+      {"dds_shield_domains", s.dds_shield_domains},
+      {"dds_shield_rx_dropped", s.dds_shield_rx_dropped},
+      {"dds_shield_tx_dropped", s.dds_shield_tx_dropped},
+      {"dds_shield_error", s.dds_shield_error},
       {"local_topics", s.local_topics},
       {"egress", s.egress},
       {"ingress", s.ingress},
@@ -741,6 +808,13 @@ inline void from_json(const nlohmann::json &j, AgentStatus &s) {
   s.total_rx_kbps = j.value("total_rx_kbps", 0.0);
   s.warn_count = j.value("warn_count", uint64_t{0});
   s.error_count = j.value("error_count", uint64_t{0});
+  s.dds_shield_enabled = j.value("dds_shield_enabled", false);
+  s.dds_shield_active = j.value("dds_shield_active", false);
+  s.dds_shield_scope = j.value("dds_shield_scope", "domain");
+  s.dds_shield_domains = j.value("dds_shield_domains", "");
+  s.dds_shield_rx_dropped = j.value("dds_shield_rx_dropped", uint64_t{0});
+  s.dds_shield_tx_dropped = j.value("dds_shield_tx_dropped", uint64_t{0});
+  s.dds_shield_error = j.value("dds_shield_error", "");
   if (j.contains("local_topics") && j["local_topics"].is_array()) {
     s.local_topics = j["local_topics"].get<std::vector<LocalTopicInfo>>();
   } else {
@@ -808,6 +882,49 @@ inline RuleSet loadRulesFromYamlFile(const std::string &path) {
   return rules;
 }
 
+inline void atomicWriteFile(const std::string &path, const std::string &content,
+                            const std::string &write_error = "Failed writing file: ",
+                            const std::string &rename_error = "Failed to atomically replace file: ") {
+  std::string tmp = path + ".tmp.XXXXXX";
+  const auto slash = path.rfind('/');
+  const auto parent = slash == std::string::npos ? "." : path.substr(0, slash + 1);
+  const int dirfd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dirfd < 0) throw std::runtime_error("Cannot open settings directory: " + parent);
+  struct CloseDirectory {
+    int fd;
+    ~CloseDirectory() { ::close(fd); }
+  } directory{dirfd};
+  const auto sync = [](int f) {
+    int rc;
+    do { rc = ::fsync(f); } while (rc < 0 && errno == EINTR);
+    return rc == 0;
+  };
+  const int fd = ::mkostemp(tmp.data(), O_CLOEXEC);
+  if (fd < 0) {
+    throw std::runtime_error("Failed to open temp file for writing: " + tmp);
+  }
+  std::size_t written = 0;
+  while (written < content.size()) {
+    const auto n = ::write(fd, content.data() + written, content.size() - written);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) break;
+    written += static_cast<std::size_t>(n);
+  }
+  const bool flushed = written == content.size() && sync(fd);
+  if (::close(fd) != 0 || !flushed) {
+    std::remove(tmp.c_str());
+    throw std::runtime_error(write_error + tmp);
+  }
+  if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+    std::remove(tmp.c_str());
+    throw std::runtime_error(rename_error + path);
+  }
+  if (!sync(dirfd)) {
+    const int error = errno;
+    throw std::runtime_error("Replaced " + path + ", but directory sync failed: " + std::strerror(error));
+  }
+}
+
 inline void saveRulesToYamlFile(const std::string &path, const RuleSet &rules) {
   YAML::Emitter out;
   out << YAML::BeginMap;
@@ -850,24 +967,8 @@ inline void saveRulesToYamlFile(const std::string &path, const RuleSet &rules) {
   out << YAML::EndSeq;
   out << YAML::EndMap;
 
-  const std::string tmp_path = path + ".tmp";
-  {
-    std::ofstream ofs(tmp_path, std::ios::out | std::ios::trunc);
-    if (!ofs.is_open()) {
-      throw std::runtime_error("Failed to open temp file for writing: " + tmp_path);
-    }
-    ofs << out.c_str() << "\n";
-    ofs.flush();
-    if (!ofs.good()) {
-      ofs.close();
-      std::remove(tmp_path.c_str());
-      throw std::runtime_error("Failed while writing rules file: " + tmp_path);
-    }
-  }
-  if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
-    std::remove(tmp_path.c_str());
-    throw std::runtime_error("Failed to atomically replace rules file: " + path);
-  }
+  atomicWriteFile(path, std::string(out.c_str()) + "\n",
+                  "Failed while writing rules file: ", "Failed to atomically replace rules file: ");
 }
 
 // ---------------- Built-in Presets ----------------

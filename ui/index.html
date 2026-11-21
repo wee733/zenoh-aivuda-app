@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Zenoh Bridge · ACEswarm</title>
+  <link rel="icon" type="image/png" href="./zenoh-icon.png" />
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
@@ -11,14 +12,17 @@
     <!-- Top Header -->
     <header class="topbar">
       <div class="brand">
-        <div class="brand-logo">Z</div>
+        <img class="brand-logo" src="./zenoh-icon.png" width="32" height="32" alt="" />
         <div>
-          <div class="brand-title">Zenoh Bridge <span class="badge badge-info">v2.1</span></div>
+          <div class="brand-title">Zenoh Bridge <span class="badge badge-info">v2.2</span></div>
           <div class="brand-sub" id="localSummary">Connecting to local Zenoh engine...</div>
         </div>
       </div>
 
       <div class="topbar-metrics">
+        <button class="shield-pill inactive" id="btnDdsShieldPill" disabled title="查看节点的 DDS 端口过滤状态">
+          <span id="ddsShieldPillText">DDS 隔离: 检测中...</span>
+        </button>
         <div class="metric-pill">
           <span class="metric-label">TX</span>
           <span class="metric-val" id="metricTx">0.0 KB/s</span>
@@ -86,6 +90,27 @@
 
         <!-- TAB 1: ROUTES & QOS -->
         <section class="tab-panel active" id="tab-routes">
+          <!-- Core Option: Per-Domain DDS Anti-Leak Shield -->
+          <div class="shield-bar" id="ddsShieldBar">
+            <div class="shield-bar-left">
+              <strong>🛡️ DDS 端口过滤</strong>
+              <label class="check-inline" title="过滤非回环接口的 IPv4/IPv6 UDP 标准 RTPS 端口。同端口的其他 UDP 流量也可能被拦截；不覆盖自定义端口或 TCP。">
+                <input type="checkbox" id="coreShieldEnabled" />
+                <span>启用隔离</span>
+              </label>
+              <select id="coreShieldScope" class="input-select" title="选择隔离范围">
+                <option value="domain">指定域的标准 RTPS 端口</option>
+                <option value="all">指定域端口 + 各域的标准发现组播端口</option>
+              </select>
+              <input type="text" id="coreShieldDomains" class="input-text mono" style="width:130px" placeholder="自动跟随 ROS 域" title="逗号分隔的域编号（0–232）；留空使用节点当前 ROS_DOMAIN_ID" />
+              <input type="password" class="input-text" id="shieldToken" aria-label="DDS 过滤管理令牌" placeholder="本机管理令牌" autocomplete="off" spellcheck="false" />
+              <button class="btn btn-xs btn-primary" id="btnCoreShieldApply" disabled>应用到本机</button>
+            </div>
+            <div class="shield-bar-right">
+              <span class="small muted mono" id="coreShieldStatus">等待节点状态</span>
+            </div>
+          </div>
+
           <div class="action-bar">
             <div class="action-bar-left">
               <span class="dirty-badge hidden" id="dirtyBadge">有未提交修改</span>
@@ -276,6 +301,8 @@
                   <label class="check-card"><input type="checkbox" id="bsAllowUnprefixed" /><span>匹配无前缀本地话题</span></label>
                   <label class="check-card"><input type="checkbox" id="bsLiveliness" /><span>启用官方 Liveliness 令牌</span></label>
                 </div>
+                <div class="muted small mt-6" id="bsDdsShieldInfo">DDS 端口过滤：等待节点状态</div>
+                <div class="muted small">请在目标节点的「路由与流控」页管理过滤策略；保存桥接设置不会修改防火墙。</div>
               </div>
             </div>
           </div>
@@ -310,7 +337,7 @@
                     <div class="form-grid">
                       <label class="field">
                         <span>运行模式 (mode)</span>
-                        <select id="sessMode" class="input-select">
+                        <select id="sessMode" data-session-key="mode" data-default="peer" class="input-select">
                           <option value="peer">peer (局域网 P2P 自动组网)</option>
                           <option value="client">client (连接中心 Router)</option>
                           <option value="router">router (路由中继节点)</option>
@@ -318,43 +345,43 @@
                       </label>
                       <label class="field">
                         <span>自定义 ZID (id，留空自动生成 16 字节 Hex)</span>
-                        <input type="text" id="sessCustomZid" class="input-text mono" placeholder="留空自动生成" />
+                        <input type="text" id="sessCustomZid" data-session-key="custom_zid" class="input-text mono" placeholder="留空自动生成" />
                       </label>
                       <label class="field">
                         <span>Zenoh 命名空间 (namespace，自动加在所有 Key 前)</span>
-                        <input type="text" id="sessNamespace" class="input-text mono" placeholder="留空无命名空间，如 robot/zone1" />
+                        <input type="text" id="sessNamespace" data-session-key="zenoh_namespace" class="input-text mono" placeholder="留空无命名空间，如 robot/zone1" />
                       </label>
                       <label class="field">
                         <span>默认查询超时 (queries_default_timeout ms)</span>
-                        <input type="number" id="sessQueriesTimeout" class="input-num full-width" min="100" step="500" />
+                        <input type="number" id="sessQueriesTimeout" data-session-key="queries_default_timeout_ms" data-default="10000" class="input-num full-width" min="100" step="500" />
                       </label>
                       <label class="field span-2">
                         <span>Connect Endpoints（每行一个，支持 <code>tcp/</code> <code>udp/</code> <code>quic/</code> <code>tls/</code> <code>ws/</code> <code>unixsock-stream/</code>）</span>
-                        <textarea id="sessConnect" class="input-textarea mono" rows="2" placeholder="tcp/192.168.20.20:7447"></textarea>
+                        <textarea id="sessConnect" data-session-key="connect_endpoints" data-format="lines" class="input-textarea mono" rows="2" placeholder="tcp/192.168.20.20:7447"></textarea>
                       </label>
                       <label class="field">
                         <span>Connect 超时 (connect.timeout_ms，0=默认)</span>
-                        <input type="number" id="sessConnectTimeout" class="input-num full-width" min="0" step="500" />
+                        <input type="number" id="sessConnectTimeout" data-session-key="connect_timeout_ms" data-default="0" class="input-num full-width" min="0" step="500" />
                       </label>
                       <label class="field">
                         <span>Connect 失败退出</span>
-                        <label class="check-card"><input type="checkbox" id="sessConnectExitFail" /><span>connect.exit_on_failure</span></label>
+                        <label class="check-card"><input type="checkbox" id="sessConnectExitFail" data-session-key="connect_exit_on_failure" /><span>connect.exit_on_failure</span></label>
                       </label>
                       <label class="field span-2">
                         <span>Listen Endpoints（每行一个，如 <code>tcp/[::]:0</code>、<code>tcp/0.0.0.0:7447</code>、<code>quic/0.0.0.0:7447</code>）</span>
-                        <textarea id="sessListen" class="input-textarea mono" rows="2" placeholder="tcp/[::]:0"></textarea>
+                        <textarea id="sessListen" data-session-key="listen_endpoints" data-format="lines" class="input-textarea mono" rows="2" placeholder="tcp/[::]:0"></textarea>
                       </label>
                       <label class="field">
                         <span>Listen 超时 (listen.timeout_ms，0=默认)</span>
-                        <input type="number" id="sessListenTimeout" class="input-num full-width" min="0" step="500" />
+                        <input type="number" id="sessListenTimeout" data-session-key="listen_timeout_ms" data-default="0" class="input-num full-width" min="0" step="500" />
                       </label>
                       <label class="field">
                         <span>Listen 失败退出</span>
-                        <label class="check-card"><input type="checkbox" id="sessListenExitFail" /><span>listen.exit_on_failure</span></label>
+                        <label class="check-card"><input type="checkbox" id="sessListenExitFail" data-session-key="listen_exit_on_failure" /><span>listen.exit_on_failure</span></label>
                       </label>
                       <label class="field span-2">
                         <span>节点元数据 (metadata JSON5 对象，可选)</span>
-                        <input type="text" id="sessMetadataJson5" class="input-text mono" placeholder='{ name: "uav1", location: "lab" }' />
+                        <input type="text" id="sessMetadataJson5" data-session-key="metadata_json5" class="input-text mono" placeholder='{ name: "uav1", location: "lab" }' />
                       </label>
                     </div>
                   </div>
@@ -367,31 +394,31 @@
                     <div class="form-grid">
                       <label class="field">
                         <span>Scouting 超时 (scouting.timeout ms)</span>
-                        <input type="number" id="sessScoutTimeout" class="input-num full-width" min="100" step="100" />
+                        <input type="number" id="sessScoutTimeout" data-session-key="scouting_timeout_ms" data-default="3000" class="input-num full-width" min="100" step="100" />
                       </label>
                       <label class="field">
                         <span>Scouting 延迟 (scouting.delay ms)</span>
-                        <input type="number" id="sessScoutDelay" class="input-num full-width" min="0" step="100" />
+                        <input type="number" id="sessScoutDelay" data-session-key="scouting_delay_ms" data-default="500" class="input-num full-width" min="0" step="100" />
                       </label>
                       <label class="field">
                         <span>Multicast 地址</span>
-                        <input type="text" id="sessMcastAddr" class="input-text mono" placeholder="224.0.0.224:7446" />
+                        <input type="text" id="sessMcastAddr" data-session-key="multicast_address" data-default="224.0.0.224:7446" class="input-text mono" placeholder="224.0.0.224:7446" />
                       </label>
                       <label class="field">
                         <span>Multicast 网卡 (interface)</span>
-                        <input type="text" id="sessMcastIface" class="input-text mono" placeholder="auto 或 enp129s0" />
+                        <input type="text" id="sessMcastIface" data-session-key="multicast_interface" data-default="auto" class="input-text mono" placeholder="auto 或 enp129s0" />
                       </label>
                       <label class="field">
                         <span>Multicast TTL</span>
-                        <input type="number" id="sessMcastTtl" class="input-num full-width" min="1" max="255" />
+                        <input type="number" id="sessMcastTtl" data-session-key="multicast_ttl" data-default="1" class="input-num full-width" min="1" max="255" />
                       </label>
                       <div class="field">
                         <span>发现选项</span>
                         <div class="toggle-grid">
-                          <label class="check-card"><input type="checkbox" id="sessMcastEn" /><span>Multicast 启用</span></label>
-                          <label class="check-card"><input type="checkbox" id="sessMcastListen" /><span>Multicast 监听</span></label>
-                          <label class="check-card"><input type="checkbox" id="sessGossipEn" /><span>Gossip 启用</span></label>
-                          <label class="check-card"><input type="checkbox" id="sessGossipMulti" /><span>Gossip Multihop</span></label>
+                          <label class="check-card"><input type="checkbox" id="sessMcastEn" data-session-key="multicast_enabled" data-default="true" /><span>Multicast 启用</span></label>
+                          <label class="check-card"><input type="checkbox" id="sessMcastListen" data-session-key="multicast_listen" data-default="true" /><span>Multicast 监听</span></label>
+                          <label class="check-card"><input type="checkbox" id="sessGossipEn" data-session-key="gossip_enabled" data-default="true" /><span>Gossip 启用</span></label>
+                          <label class="check-card"><input type="checkbox" id="sessGossipMulti" data-session-key="gossip_multihop" /><span>Gossip Multihop</span></label>
                         </div>
                       </div>
                     </div>
@@ -403,67 +430,67 @@
                   <summary>3. 传输、多链路、队列与 TCP 调优 (Transport / MultiLink / TX-RX / TCP)</summary>
                   <div class="cfg-group-body">
                     <div class="toggle-grid" style="margin-bottom:10px">
-                      <label class="check-card"><input type="checkbox" id="sessLowLatency" /><span>Unicast LowLatency</span></label>
-                      <label class="check-card"><input type="checkbox" id="sessUnicastQos" /><span>Unicast QoS</span></label>
-                      <label class="check-card"><input type="checkbox" id="sessCompression" /><span>Unicast Compression</span></label>
-                      <label class="check-card"><input type="checkbox" id="sessBatching" /><span>TX Batching</span></label>
-                      <label class="check-card"><input type="checkbox" id="sessMcastQos" /><span>Multicast QoS</span></label>
-                      <label class="check-card"><input type="checkbox" id="sessMcastComp" /><span>Multicast Compression</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessLowLatency" data-session-key="unicast_lowlatency" /><span>Unicast LowLatency</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessUnicastQos" data-session-key="unicast_qos_enabled" data-default="true" /><span>Unicast QoS</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessCompression" data-session-key="compression_enabled" /><span>Unicast Compression</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessBatching" data-session-key="batching_enabled" data-default="true" /><span>TX Batching</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessMcastQos" data-session-key="multicast_qos_enabled" /><span>Multicast QoS</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessMcastComp" data-session-key="multicast_compression_enabled" /><span>Multicast Compression</span></label>
                     </div>
                     <div class="form-grid">
                       <label class="field">
                         <span>最大会话数 (unicast.max_sessions)</span>
-                        <input type="number" id="sessMaxSessions" class="input-num full-width" min="1" />
+                        <input type="number" id="sessMaxSessions" data-session-key="unicast_max_sessions" data-default="1000" class="input-num full-width" min="1" />
                       </label>
                       <label class="field">
                         <span>单会话最大链路数 (max_links 多链路聚合)</span>
-                        <input type="number" id="sessMaxLinks" class="input-num full-width" min="1" max="16" />
+                        <input type="number" id="sessMaxLinks" data-session-key="unicast_max_links" data-default="1" class="input-num full-width" min="1" max="16" />
                       </label>
                       <label class="field">
                         <span>Unicast Open / Accept 超时 (ms)</span>
                         <div class="btn-row">
-                          <input type="number" id="sessOpenTimeout" class="input-num flex-1" min="500" title="open_timeout" />
-                          <input type="number" id="sessAcceptTimeout" class="input-num flex-1" min="500" title="accept_timeout" />
+                          <input type="number" id="sessOpenTimeout" data-session-key="unicast_open_timeout" data-default="10000" class="input-num flex-1" min="500" title="open_timeout" />
+                          <input type="number" id="sessAcceptTimeout" data-session-key="unicast_accept_timeout" data-default="10000" class="input-num flex-1" min="500" title="accept_timeout" />
                         </div>
                       </label>
                       <label class="field">
                         <span>链路租约 Lease (ms) / KeepAlive</span>
                         <div class="btn-row">
-                          <input type="number" id="sessLeaseMs" class="input-num flex-1" min="1000" step="1000" title="lease_ms" />
-                          <input type="number" id="sessKeepAlive" class="input-num flex-1" min="1" max="20" title="keep_alive" />
+                          <input type="number" id="sessLeaseMs" data-session-key="lease_ms" data-default="10000" class="input-num flex-1" min="1000" step="1000" title="lease_ms" />
+                          <input type="number" id="sessKeepAlive" data-session-key="keep_alive" data-default="4" class="input-num flex-1" min="1" max="20" title="keep_alive" />
                         </div>
                       </label>
                       <label class="field">
                         <span>TX Batch Size / Batch Time Limit (ms)</span>
                         <div class="btn-row">
-                          <input type="number" id="sessTxBatchSize" class="input-num flex-1" min="1024" max="65535" title="batch_size" />
-                          <input type="number" id="sessBatchTimeLimit" class="input-num flex-1" min="0" title="time_limit" />
+                          <input type="number" id="sessTxBatchSize" data-session-key="tx_batch_size" data-default="65535" class="input-num flex-1" min="1024" max="65535" title="batch_size" />
+                          <input type="number" id="sessBatchTimeLimit" data-session-key="batching_time_limit_ms" data-default="1" class="input-num flex-1" min="0" title="time_limit" />
                         </div>
                       </label>
                       <label class="field">
                         <span>TX Threads (0=默认) / Mcast Join Interval</span>
                         <div class="btn-row">
-                          <input type="number" id="sessTxThreads" class="input-num flex-1" min="0" max="64" title="tx.threads" />
-                          <input type="number" id="sessMcastJoinInt" class="input-num flex-1" min="100" title="multicast.join_interval" />
+                          <input type="number" id="sessTxThreads" data-session-key="tx_threads" data-default="0" class="input-num flex-1" min="0" max="64" title="tx.threads" />
+                          <input type="number" id="sessMcastJoinInt" data-session-key="multicast_join_interval" data-default="2500" class="input-num flex-1" min="100" title="multicast.join_interval" />
                         </div>
                       </label>
                       <label class="field">
                         <span>RX Buffer Size / Max Message Size (B)</span>
                         <div class="btn-row">
-                          <input type="number" id="sessRxBufSize" class="input-num flex-1" min="1024" title="rx.buffer_size" />
-                          <input type="number" id="sessRxMaxMsg" class="input-num flex-1" min="65535" title="rx.max_message_size" />
+                          <input type="number" id="sessRxBufSize" data-session-key="rx_buffer_size" data-default="65535" class="input-num flex-1" min="1024" title="rx.buffer_size" />
+                          <input type="number" id="sessRxMaxMsg" data-session-key="rx_max_message_size" data-default="1073741824" class="input-num flex-1" min="65535" title="rx.max_message_size" />
                         </div>
                       </label>
                       <label class="field">
                         <span>TCP SO_SNDBUF / SO_RCVBUF (0=OS 默认)</span>
                         <div class="btn-row">
-                          <input type="number" id="sessTcpSndBuf" class="input-num flex-1" min="0" title="so_sndbuf" />
-                          <input type="number" id="sessTcpRcvBuf" class="input-num flex-1" min="0" title="so_rcvbuf" />
+                          <input type="number" id="sessTcpSndBuf" data-session-key="tcp_so_sndbuf" data-default="0" class="input-num flex-1" min="0" title="so_sndbuf" />
+                          <input type="number" id="sessTcpRcvBuf" data-session-key="tcp_so_rcvbuf" data-default="0" class="input-num flex-1" min="0" title="so_rcvbuf" />
                         </div>
                       </label>
                       <label class="field span-2">
                         <span>TX 队列高级 JSON5 (<code>transport.link.tx.queue</code>，可自定义 8 级队列深度与拥塞超时)</span>
-                        <textarea id="sessTxQueueJson5" class="input-textarea mono" rows="2" placeholder='{ size: { real_time: 4, data_high: 4, data: 2 } }'></textarea>
+                        <textarea id="sessTxQueueJson5" data-session-key="tx_queue_json5" class="input-textarea mono" rows="2" placeholder='{ size: { real_time: 4, data_high: 4, data: 2 } }'></textarea>
                       </label>
                     </div>
                   </div>
@@ -474,24 +501,24 @@
                   <summary>4. 共享内存零拷贝 (Shared Memory / SHM)</summary>
                   <div class="cfg-group-body">
                     <div class="toggle-grid" style="margin-bottom:10px">
-                      <label class="check-card"><input type="checkbox" id="sessShm" /><span>启用 SHM</span></label>
-                      <label class="check-card"><input type="checkbox" id="sessShmOpt" /><span>自动传输优化 (transport_optimization)</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessShm" data-session-key="shared_memory_enabled" /><span>启用 SHM</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessShmOpt" data-session-key="shm_opt_enabled" data-default="true" /><span>自动传输优化 (transport_optimization)</span></label>
                     </div>
                     <div class="form-grid">
                       <label class="field">
                         <span>初始化模式 (shared_memory.mode)</span>
-                        <select id="sessShmMode" class="input-select">
+                        <select id="sessShmMode" data-session-key="shm_mode" data-default="lazy" class="input-select">
                           <option value="lazy">lazy (按需延迟分配)</option>
                           <option value="init">init (启动即初始化)</option>
                         </select>
                       </label>
                       <label class="field">
                         <span>SHM 内存池大小 (pool_size 字节)</span>
-                        <input type="number" id="sessShmPoolSize" class="input-num full-width" min="65536" step="1048576" />
+                        <input type="number" id="sessShmPoolSize" data-session-key="shm_pool_size" data-default="16777216" class="input-num full-width" min="65536" step="1048576" />
                       </label>
                       <label class="field span-2">
                         <span>SHM 启用阈值 (message_size_threshold 字节，超过此大小自动走 SHM)</span>
-                        <input type="number" id="sessShmThreshold" class="input-num full-width" min="0" step="512" />
+                        <input type="number" id="sessShmThreshold" data-session-key="shm_message_threshold" data-default="3072" class="input-num full-width" min="0" step="512" />
                       </label>
                     </div>
                   </div>
@@ -504,66 +531,66 @@
                     <div class="form-grid">
                       <label class="field span-2">
                         <span>TLS Root CA 证书路径 (<code>transport.link.tls.root_ca_certificate</code>)</span>
-                        <input type="text" id="sessTlsRootCa" class="input-text mono" placeholder="/path/to/ca.pem" />
+                        <input type="text" id="sessTlsRootCa" data-session-key="tls_root_ca" class="input-text mono" placeholder="/path/to/ca.pem" />
                       </label>
                       <label class="field">
                         <span>TLS Listen 证书 (listen_certificate)</span>
-                        <input type="text" id="sessTlsListenCert" class="input-text mono" placeholder="/path/to/server.crt" />
+                        <input type="text" id="sessTlsListenCert" data-session-key="tls_listen_cert" class="input-text mono" placeholder="/path/to/server.crt" />
                       </label>
                       <label class="field">
                         <span>TLS Listen 私钥 (listen_private_key)</span>
-                        <input type="text" id="sessTlsListenKey" class="input-text mono" placeholder="/path/to/server.key" />
+                        <input type="text" id="sessTlsListenKey" data-session-key="tls_listen_key" class="input-text mono" placeholder="/path/to/server.key" />
                       </label>
                       <label class="field">
                         <span>mTLS 客户端证书 (connect_certificate)</span>
-                        <input type="text" id="sessTlsConnectCert" class="input-text mono" placeholder="/path/to/client.crt" />
+                        <input type="text" id="sessTlsConnectCert" data-session-key="tls_connect_cert" class="input-text mono" placeholder="/path/to/client.crt" />
                       </label>
                       <label class="field">
                         <span>mTLS 客户端私钥 (connect_private_key)</span>
-                        <input type="text" id="sessTlsConnectKey" class="input-text mono" placeholder="/path/to/client.key" />
+                        <input type="text" id="sessTlsConnectKey" data-session-key="tls_connect_key" class="input-text mono" placeholder="/path/to/client.key" />
                       </label>
                       <div class="toggle-grid span-2">
-                        <label class="check-card"><input type="checkbox" id="sessTlsMtls" /><span>启用双向认证 mTLS</span></label>
-                        <label class="check-card"><input type="checkbox" id="sessTlsVerifyName" /><span>连接时校验主机名 (verify_name)</span></label>
+                        <label class="check-card"><input type="checkbox" id="sessTlsMtls" data-session-key="tls_enable_mtls" /><span>启用双向认证 mTLS</span></label>
+                        <label class="check-card"><input type="checkbox" id="sessTlsVerifyName" data-session-key="tls_verify_name" data-default="true" /><span>连接时校验主机名 (verify_name)</span></label>
                       </div>
                       <label class="field">
                         <span>账号密码认证 User (usrpwd.user)</span>
-                        <input type="text" id="sessAuthUser" class="input-text mono" placeholder="留空不启用" />
+                        <input type="text" id="sessAuthUser" data-session-key="auth_user" class="input-text mono" placeholder="留空不启用" />
                       </label>
                       <label class="field">
                         <span>账号密码认证 Password</span>
-                        <input type="password" id="sessAuthPass" class="input-text mono" placeholder="留空不启用" />
+                        <input type="password" id="sessAuthPass" data-session-key="auth_password" class="input-text mono" placeholder="留空不启用" />
                       </label>
                       <label class="field span-2">
                         <span>UsrPwd 密码字典文件 (usrpwd.dictionary_file)</span>
-                        <input type="text" id="sessAuthDict" class="input-text mono" placeholder="/path/to/users.txt" />
+                        <input type="text" id="sessAuthDict" data-session-key="auth_dictionary_file" class="input-text mono" placeholder="/path/to/users.txt" />
                       </label>
                       <label class="field">
                         <span>PubKey 公钥文件 (public_key_file)</span>
-                        <input type="text" id="sessAuthPubKey" class="input-text mono" placeholder="/path/to/id_rsa.pub" />
+                        <input type="text" id="sessAuthPubKey" data-session-key="auth_pubkey_file" class="input-text mono" placeholder="/path/to/id_rsa.pub" />
                       </label>
                       <label class="field">
                         <span>PubKey 私钥文件 (private_key_file)</span>
-                        <input type="text" id="sessAuthPrivKey" class="input-text mono" placeholder="/path/to/id_rsa" />
+                        <input type="text" id="sessAuthPrivKey" data-session-key="auth_privkey_file" class="input-text mono" placeholder="/path/to/id_rsa" />
                       </label>
                       <label class="field span-2">
                         <span>PubKey 信任公钥列表 (known_keys_file)</span>
-                        <input type="text" id="sessAuthKnownKeys" class="input-text mono" placeholder="/path/to/known_keys" />
+                        <input type="text" id="sessAuthKnownKeys" data-session-key="auth_known_keys_file" class="input-text mono" placeholder="/path/to/known_keys" />
                       </label>
                       <label class="field">
                         <span>访问控制 ACL 开关</span>
-                        <label class="check-card"><input type="checkbox" id="sessAclEnabled" /><span>access_control.enabled</span></label>
+                        <label class="check-card"><input type="checkbox" id="sessAclEnabled" data-session-key="acl_enabled" /><span>access_control.enabled</span></label>
                       </label>
                       <label class="field">
                         <span>ACL 默认策略 (default_permission)</span>
-                        <select id="sessAclDefaultPerm" class="input-select">
+                        <select id="sessAclDefaultPerm" data-session-key="acl_default_permission" data-default="deny" class="input-select">
                           <option value="deny">deny (默认拒绝)</option>
                           <option value="allow">allow (默认允许)</option>
                         </select>
                       </label>
                       <label class="field span-2">
                         <span>完整 ACL JSON5 对象（留空则仅用上方开关；填写则完整覆盖 <code>access_control</code>）</span>
-                        <textarea id="sessAclJson5" class="input-textarea mono" rows="3" placeholder='{ enabled: true, default_permission: "deny", rules: [], subjects: [], policies: [] }'></textarea>
+                        <textarea id="sessAclJson5" data-session-key="acl_json5" class="input-textarea mono" rows="3" placeholder='{ enabled: true, default_permission: "deny", rules: [], subjects: [], policies: [] }'></textarea>
                       </label>
                     </div>
                   </div>
@@ -574,45 +601,45 @@
                   <summary>6. 路由、时间戳、AdminSpace、内核流控与插件 (Routing / Downsampling / LowPass / QoS / Plugins)</summary>
                   <div class="cfg-group-body">
                     <div class="toggle-grid" style="margin-bottom:10px">
-                      <label class="check-card"><input type="checkbox" id="sessTimestamp" /><span>HLC Timestamping</span></label>
-                      <label class="check-card"><input type="checkbox" id="sessDropFutureTs" /><span>Drop Future Timestamp</span></label>
-                      <label class="check-card"><input type="checkbox" id="sessFailoverBroker" /><span>Peers Failover Brokering</span></label>
-                      <label class="check-card"><input type="checkbox" id="sessAdminEn" /><span>启用 AdminSpace (@/**)</span></label>
-                      <label class="check-card"><input type="checkbox" id="sessAdminRead" /><span>AdminSpace 只读</span></label>
-                      <label class="check-card"><input type="checkbox" id="sessAdminWrite" /><span>AdminSpace 可写</span></label>
-                      <label class="check-card"><input type="checkbox" id="sessPluginsLoad" /><span>启用 Plugins Loading</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessTimestamp" data-session-key="timestamping_enabled" /><span>HLC Timestamping</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessDropFutureTs" data-session-key="drop_future_timestamp" /><span>Drop Future Timestamp</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessFailoverBroker" data-session-key="peers_failover_brokering" data-default="true" /><span>Peers Failover Brokering</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessAdminEn" data-session-key="adminspace_enabled" /><span>启用 AdminSpace (@/**)</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessAdminRead" data-session-key="adminspace_read" data-default="true" /><span>AdminSpace 只读</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessAdminWrite" data-session-key="adminspace_write" /><span>AdminSpace 可写</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessPluginsLoad" data-session-key="plugins_loading_enabled" /><span>启用 Plugins Loading</span></label>
                     </div>
                     <div class="form-grid">
                       <label class="field span-2">
                         <span>Peer 路由模式 (routing.peer.mode)</span>
-                        <select id="sessPeerRoutingMode" class="input-select">
+                        <select id="sessPeerRoutingMode" data-session-key="peer_routing_mode" data-default="peer_to_peer" class="input-select">
                           <option value="peer_to_peer">peer_to_peer (直连全网状)</option>
                           <option value="linkstate">linkstate (多跳链路状态路由)</option>
                         </select>
                       </label>
                       <label class="field span-2">
                         <span>内核级降采样 (<code>downsampling</code> JSON5 数组)</span>
-                        <textarea id="sessDownsampling" class="input-textarea mono" rows="2" placeholder='[{ messages: ["put"], rules: [{ key_expr: "swarm/data/**/cloud_registered", freq: 2.0 }] }]'></textarea>
+                        <textarea id="sessDownsampling" data-session-key="downsampling_json5" class="input-textarea mono" rows="2" placeholder='[{ messages: ["put"], rules: [{ key_expr: "swarm/data/**/cloud_registered", freq: 2.0 }] }]'></textarea>
                       </label>
                       <label class="field span-2">
                         <span>内核级低通大小过滤 (<code>low_pass_filter</code> JSON5 数组)</span>
-                        <textarea id="sessLowPass" class="input-textarea mono" rows="2" placeholder='[{ flows: ["egress"], key_exprs: ["swarm/**"], size_limit: 65536 }]'></textarea>
+                        <textarea id="sessLowPass" data-session-key="low_pass_filter_json5" class="input-textarea mono" rows="2" placeholder='[{ flows: ["egress"], key_exprs: ["swarm/**"], size_limit: 65536 }]'></textarea>
                       </label>
                       <label class="field span-2">
                         <span>内核级发布 QoS 覆写 (<code>qos.publication</code> JSON5 数组)</span>
-                        <textarea id="sessQosPub" class="input-textarea mono" rows="2" placeholder='[{ key_exprs: ["swarm/data/**/state"], config: { priority: "real_time", express: true } }]'></textarea>
+                        <textarea id="sessQosPub" data-session-key="qos_publication_json5" class="input-textarea mono" rows="2" placeholder='[{ key_exprs: ["swarm/data/**/state"], config: { priority: "real_time", express: true } }]'></textarea>
                       </label>
                       <label class="field span-2">
                         <span>内核级网络 DSCP/QoS 覆写 (<code>qos.network</code> JSON5 数组)</span>
-                        <textarea id="sessQosNet" class="input-textarea mono" rows="2" placeholder='[]'></textarea>
+                        <textarea id="sessQosNet" data-session-key="qos_network_json5" class="input-textarea mono" rows="2" placeholder='[]'></textarea>
                       </label>
                       <label class="field span-2">
                         <span>路由聚合 (<code>aggregation</code> JSON5 对象)</span>
-                        <textarea id="sessAggregation" class="input-textarea mono" rows="2" placeholder='{ subscribers: [], publishers: [] }'></textarea>
+                        <textarea id="sessAggregation" data-session-key="aggregation_json5" class="input-textarea mono" rows="2" placeholder='{ subscribers: [], publishers: [] }'></textarea>
                       </label>
                       <label class="field span-2">
                         <span>官方插件配置 (<code>plugins</code> JSON5 对象，如 rest / storage_manager / remote_api)</span>
-                        <textarea id="sessPluginsJson5" class="input-textarea mono" rows="2" placeholder='{ rest: { http_port: 8000 } }'></textarea>
+                        <textarea id="sessPluginsJson5" data-session-key="plugins_json5" class="input-textarea mono" rows="2" placeholder='{ rest: { http_port: 8000 } }'></textarea>
                       </label>
                     </div>
                   </div>
@@ -622,7 +649,7 @@
                 <details class="cfg-group" open>
                   <summary>7. 额外原生 JSON5 叠加覆盖（真 JSON5：由 Zenoh 内核直接解析，支持 // 注释与尾逗号）</summary>
                   <div class="cfg-group-body">
-                    <textarea id="sessCustomJson" class="input-textarea mono" rows="4" placeholder='// 任意官方 Zenoh 1.8 JSON5 片段，如：&#10;{&#10;  stats: { filters: [] },&#10;  open: { return_conditions: { connect_scouted: true } },&#10;}'></textarea>
+                    <textarea id="sessCustomJson" data-session-key="custom_json5" class="input-textarea mono" rows="4" placeholder='// 任意官方 Zenoh 1.8 JSON5 片段，如：&#10;{&#10;  stats: { filters: [] },&#10;  open: { return_conditions: { connect_scouted: true } },&#10;}'></textarea>
                     <div class="btn-row mt-6" style="justify-content:flex-end">
                       <button class="btn btn-xs btn-secondary" id="btnSwitchToRawWithEffective">复制当前生效配置到「原生完整 JSON5」编辑 &rarr;</button>
                     </div>
@@ -639,7 +666,7 @@
                   <button class="btn btn-xs btn-ghost" id="btnRawExport">导出 .json5</button>
                   <input type="file" id="rawJson5FileInput" accept=".json5,.json,.txt" class="hidden" />
                 </div>
-                <textarea id="sessRawJson5" class="input-textarea mono code-editor" placeholder='// 直接编写完整官方 Zenoh 1.8 JSON5 配置，原生透传 zenoh::Config::from_str()'></textarea>
+                <textarea id="sessRawJson5" data-session-key="raw_json5" data-format="raw" class="input-textarea mono code-editor" placeholder='// 直接编写完整官方 Zenoh 1.8 JSON5 配置，原生透传 zenoh::Config::from_str()'></textarea>
               </div>
 
               <div id="cfgValidateBox" class="validate-box hidden mono"></div>

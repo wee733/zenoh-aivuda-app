@@ -16,6 +16,32 @@
   const EGRESS_QOS = ['auto', 'best_effort', 'reliable', 'sensor_data', 'transient_local'];
   const INGRESS_QOS = ['auto', 'best_effort', 'reliable', 'transient_local'];
 
+  const EGRESS_FIELDS = {
+    'eg-enabled': 'enabled',
+    'eg-topic': 'topic',
+    'eg-zkey': 'zenoh_key',
+    'eg-freq': 'max_freq',
+    'eg-kbps': 'max_kbps',
+    'eg-ondemand': 'on_demand',
+    'eg-prio': 'priority',
+    'eg-cong': 'congestion',
+    'eg-express': 'express',
+    'eg-rel': 'reliability',
+    'eg-loc': 'locality',
+    'eg-qos': 'qos',
+    'eg-depth': 'history_depth',
+  };
+  const INGRESS_FIELDS = {
+    'ig-enabled': 'enabled',
+    'ig-pat': 'pattern',
+    'ig-remap': 'remap_prefix',
+    'ig-excl': 'exclude_self',
+    'ig-freq': 'max_freq',
+    'ig-loc': 'locality',
+    'ig-qos': 'qos',
+    'ig-depth': 'history_depth',
+  };
+
   const state = {
     localAgentId: '',
     selectedAgentId: '',
@@ -28,7 +54,7 @@
     lastEffectiveConfigText: '',
     sniffActive: false,
     activeTab: 'routes',
-    logsCache: [],
+    logsCache: null,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -43,8 +69,8 @@
 
   async function api(path, options = {}) {
     const resp = await fetch(`${API_BASE}${path}`, {
-      headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
       ...options,
+      headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
     });
     const data = await resp.json().catch(() => ({ ok: false, message: `HTTP ${resp.status}` }));
     if (!resp.ok && data.ok === undefined) {
@@ -76,6 +102,19 @@
     return state.agents.find((a) => a.agent_id === state.selectedAgentId) || null;
   }
 
+  let logRequestId = 0;
+  let lastAppliedLogRequest = 0;
+
+  function selectAgent(id) {
+    if (state.selectedAgentId === id) return;
+    state.selectedAgentId = id;
+    $('shieldToken').value = '';
+    invalidateSessionInfo();
+    lastAppliedLogRequest = logRequestId;
+    state.logsCache = null;
+    renderLogs();
+  }
+
   function setConfigMode(mode) {
     state.configMode = mode === 'raw_json5' ? 'raw_json5' : 'structured';
     const isRaw = state.configMode === 'raw_json5';
@@ -99,19 +138,35 @@
 
   // ---------------- Fleet & Polling ----------------
 
-  async function pollAgents() {
+  let currentPoll;
+  let queuedPoll;
+
+  function pollAgents() {
+    if (currentPoll) {
+      queuedPoll ??= currentPoll.then(() => {
+        queuedPoll = null;
+        return pollAgents();
+      });
+      return queuedPoll;
+    }
+    currentPoll = refreshAgents().finally(() => { currentPoll = null; });
+    return currentPoll;
+  }
+
+  async function refreshAgents() {
+    const controller = new AbortController();
+    const deadline = setTimeout(() => controller.abort(), 8000);
     try {
-      const data = await api('/agents');
+      const data = await api('/agents', { signal: controller.signal });
       if (!data.ok) throw new Error(data.message || 'API error');
 
       $('apiStatusDot').className = 'conn-dot ok';
       state.localAgentId = data.local_agent_id;
       state.agents = data.agents || [];
 
-      if (!state.selectedAgentId || !state.agents.some((a) => a.agent_id === state.selectedAgentId)) {
-        state.selectedAgentId = state.localAgentId || (state.agents[0]?.agent_id ?? '');
-        loadDraftFromSelectedAgent();
-        state.sessionLoadedForAgent = '';
+      const needsSelection = !state.selectedAgentId || !getSelectedAgent();
+      if (needsSelection) {
+        selectAgent(state.localAgentId || (state.agents[0]?.agent_id ?? ''));
       }
 
       const local = state.agents.find((a) => a.agent_id === state.localAgentId);
@@ -125,8 +180,8 @@
       renderFleet();
       renderAgentBanner();
 
-      if (!state.dirty) {
-        loadDraftFromSelectedAgent();
+      if (needsSelection || !state.dirty) {
+        loadDraftFromSelectedAgent(needsSelection);
       } else {
         updateLiveMetricCellsOnly();
       }
@@ -140,18 +195,48 @@
       }
     } catch (e) {
       $('apiStatusDot').className = 'conn-dot err';
-      $('localSummary').textContent = `无法连接后端 API: ${e.message}`;
+      $('localSummary').textContent = `无法连接后端 API: ${controller.signal.aborted ? '请求超时' : e.message}`;
+      for (const agent of state.agents) agent.online = false;
+      renderFleet();
+      updateDdsShieldUi(getSelectedAgent());
+    } finally {
+      clearTimeout(deadline);
     }
   }
 
-  function loadDraftFromSelectedAgent() {
+  function sameRuleFields(previous, current, fields) {
+    return previous.length === current.length && previous.every((rule, i) =>
+      fields.every((field) => rule[field] === current[i][field]));
+  }
+
+  function loadDraftFromSelectedAgent(force = true) {
     const ag = getSelectedAgent();
     if (!ag) return;
-    state.draftEgress = JSON.parse(JSON.stringify(ag.egress || []));
-    state.draftIngress = JSON.parse(JSON.stringify(ag.ingress || []));
+    const egress = ag.egress || [];
+    const ingress = ag.ingress || [];
+    const rebuildEgress = force || !sameRuleFields(state.draftEgress, egress, Object.values(EGRESS_FIELDS));
+    const rebuildIngress = force || !sameRuleFields(state.draftIngress, ingress, Object.values(INGRESS_FIELDS));
+    state.draftEgress = egress.map((rule) => ({ ...rule }));
+    state.draftIngress = ingress.map((rule) => ({ ...rule }));
     setDirty(false);
-    renderEgressTable();
-    renderIngressTable();
+    if (rebuildEgress) {
+      renderEgressTable();
+    } else {
+      $('egressTbody').querySelectorAll('tr[data-idx]').forEach((row, i) => {
+        const cell = row.querySelector('.eg-stat');
+        cell.dataset.topic = egress[i].topic;
+        cell.innerHTML = formatEgressStatHtml(egress[i]);
+        row.querySelector('.resolved-type').textContent = egress[i].resolved_type || '等待本机发布...';
+      });
+    }
+    if (rebuildIngress) {
+      renderIngressTable();
+    } else {
+      $('ingressTbody').querySelectorAll('.ig-stat').forEach((cell, i) => {
+        cell.dataset.pat = ingress[i].pattern;
+        cell.innerHTML = formatIngressStatHtml(ingress[i]);
+      });
+    }
   }
 
   function renderFleet() {
@@ -165,6 +250,9 @@
         const active = ag.agent_id === state.selectedAgentId ? 'active' : '';
         const dot = ag.online ? 'dot-green' : 'dot-gray';
         const localTag = ag.is_local ? '<span class="badge badge-info">LOCAL</span>' : '';
+        const shieldTag = ag.online && ag.dds_shield_active && !ag.dds_shield_error
+          ? '<span class="badge badge-ok" title="节点报告 DDS 端口过滤已生效">🛡️</span>'
+          : '';
         const errTag = (ag.error_count || 0) > 0
           ? `<span class="badge badge-err" title="存在 ${ag.error_count} 条错误日志">! ${ag.error_count}</span>`
           : '';
@@ -172,7 +260,7 @@
           <div class="fleet-card ${active}" data-agent="${escapeHtml(ag.agent_id)}">
             <div class="fleet-row">
               <div class="fleet-name"><span class="dot ${dot}"></span>${escapeHtml(ag.agent_id)}</div>
-              <div class="btn-row" style="gap:4px">${errTag}${localTag}</div>
+              <div class="btn-row" style="gap:4px">${shieldTag}${errTag}${localTag}</div>
             </div>
             <div class="fleet-meta">
               <span>${escapeHtml(ag.zenoh_mode)} · ${escapeHtml(ag.ros_distro || 'ros2')}</span>
@@ -186,8 +274,7 @@
       card.addEventListener('click', () => {
         const id = card.getAttribute('data-agent');
         if (id && id !== state.selectedAgentId) {
-          state.selectedAgentId = id;
-          state.sessionLoadedForAgent = '';
+          selectAgent(id);
           loadDraftFromSelectedAgent();
           renderFleet();
           renderAgentBanner();
@@ -211,6 +298,7 @@
     $('topicCountBadge').textContent = String((ag.local_topics || []).length);
     $('discAgentName').textContent = ag.agent_id;
     $('logsAgentName').textContent = ag.agent_id;
+    updateDdsShieldUi(ag);
     const alerts = (ag.error_count || 0) + (ag.warn_count || 0);
     const lb = $('logAlertBadge');
     if (alerts > 0) {
@@ -221,6 +309,128 @@
       lb.classList.add('hidden');
       lb.classList.remove('alert');
     }
+  }
+
+  let shieldFormAgent = '';
+  let shieldBaseline = null;
+  const shieldControls = { enabled: 'coreShieldEnabled', scope: 'coreShieldScope', domains: 'coreShieldDomains' };
+
+  function readShieldField(key) {
+    const input = $(shieldControls[key]);
+    return key === 'enabled' ? input.checked : input.value;
+  }
+
+  function canEditShield(ag) {
+    return ag?.online && ag.is_local && ag.agent_id === state.localAgentId &&
+      typeof ag.dds_shield_configured_domains === 'string' && window.isSecureContext;
+  }
+
+  function updateDdsShieldUi(ag) {
+    const pill = $('btnDdsShieldPill');
+    const txt = $('ddsShieldPillText');
+    const bar = $('ddsShieldBar');
+    const barStatus = $('coreShieldStatus');
+    const infoEl = $('bsDdsShieldInfo');
+    if (!ag || !pill || !txt) return;
+
+    const rx = ag.dds_shield_rx_dropped || 0;
+    const tx = ag.dds_shield_tx_dropped || 0;
+    const total = rx + tx;
+    const scope = ag.dds_shield_scope === 'all' ? 'all' : 'domain';
+    const scopeLabel = `域 ${ag.dds_shield_domains || '未知'} 标准 UDP 端口` + (scope === 'all' ? '及各域发现组播端口' : '');
+    const local = ag.is_local && ag.agent_id === state.localAgentId;
+    const hasPolicy = typeof ag.dds_shield_configured_domains === 'string';
+    const editable = canEditShield(ag);
+    const active = ag.online && ag.dds_shield_active && !ag.dds_shield_error;
+    for (const id of ['btnDdsShieldPill', 'coreShieldEnabled', 'coreShieldScope', 'coreShieldDomains', 'shieldToken', 'btnCoreShieldApply']) {
+      $(id).disabled = !editable;
+    }
+    pill.classList.remove('active', 'inactive', 'neutral');
+    pill.classList.add(active ? 'active' : 'neutral');
+    if (bar) bar.classList.toggle('active', Boolean(active));
+
+    const policy = { enabled: Boolean(ag.dds_shield_enabled), scope,
+      domains: ag.dds_shield_configured_domains ?? ag.dds_shield_domains ?? '' };
+    const previous = shieldFormAgent === ag.agent_id ? shieldBaseline : null;
+    let conflict = false;
+    for (const [key, id] of Object.entries(shieldControls)) {
+      // Polling preserves edits to fields whose live value hasn't changed.
+      if (previous && policy[key] === previous[key]) continue;
+      const draft = readShieldField(key);
+      if (previous && draft !== previous[key] && draft !== policy[key]) conflict = true;
+      $(id)[key === 'enabled' ? 'checked' : 'value'] = policy[key];
+    }
+    if (conflict) toast('其他操作修改了过滤策略，冲突项已更新。请核对后再应用。', 'err');
+    shieldFormAgent = ag.agent_id;
+    shieldBaseline = policy;
+
+    const summary = !ag.online ? '节点离线，状态未知'
+      : ag.dds_shield_error ? '过滤状态未确认'
+      : active ? `过滤中（拦截 ${total} 包）`
+      : ag.dds_shield_enabled ? '已配置，未检测到生效规则' : '本实例未启用';
+    const details = ag.dds_shield_error || (active ? `${scopeLabel} · RX ${rx} / TX ${tx}` : '');
+    const access = !ag.online ? '连接恢复前无法管理。' : !local ? '远端只读，请前往目标节点管理。'
+      : !hasPolicy ? '此节点未提供可编辑的过滤配置。'
+      : !editable ? '请使用 HTTPS 或本机回环地址管理。' : '修改需要本机管理令牌。';
+    txt.textContent = `🛡️ ${ag.agent_id}: ${summary}`;
+    pill.title = `${summary} ${details}。${access}`;
+    if (barStatus) barStatus.textContent = [summary, details, access].filter(Boolean).join(' · ');
+    if (infoEl) infoEl.textContent = `DDS 端口过滤：${summary}`;
+  }
+
+  async function applyDdsShield(agentId, patch) {
+    const agent = getSelectedAgent();
+    if (!canEditShield(agent) || agent.agent_id !== agentId || shieldFormAgent !== agentId) return;
+    const token = $('shieldToken').value;
+    if (!token) {
+      toast('请在「路由与流控」页输入本机的 DDS 过滤管理令牌', 'err');
+      $('shieldToken').focus();
+      return;
+    }
+    $('shieldToken').value = '';
+    let res;
+    try {
+      res = await api('/dds_shield', {
+        method: 'POST', redirect: 'error',
+        headers: { 'X-DDS-Shield-Token': token },
+        body: JSON.stringify({ agent_id: agentId, ...patch, expected_policy: shieldBaseline, save: true }),
+      });
+    } catch (e) {
+      toast(`未收到防火墙操作结果，请刷新状态：${e.message}`, 'err');
+      return;
+    }
+    if (res.ok) {
+      // Accept server normalization (e.g. "09,2" -> "2,9") without replacing edits made in flight.
+      if (state.selectedAgentId === agentId && 'domains' in patch &&
+          readShieldField('domains') === patch.domains && typeof res.domains === 'string') {
+        $('coreShieldDomains').value = res.domains;
+      }
+      toast(`${agentId}: ${res.message || 'DDS 过滤策略已更新'}`, 'ok');
+      await pollAgents();
+    } else {
+      toast(`${agentId} DDS 隔离锁操作失败: ${res.message || '未知错误'}`, 'err');
+      await pollAgents();
+    }
+  }
+
+  async function toggleDdsShieldForSelected() {
+    const ag = getSelectedAgent();
+    if (!ag) return;
+    // The shortcut only toggles; it must not apply unrelated unsaved form fields.
+    await applyDdsShield(ag.agent_id, { enabled: !ag.dds_shield_active });
+  }
+
+  async function applyCoreShieldBar() {
+    const ag = getSelectedAgent();
+    if (!ag || !shieldBaseline) return;
+    const patch = {};
+    for (const key of Object.keys(shieldControls)) {
+      const value = readShieldField(key);
+      if (value !== shieldBaseline[key]) patch[key] = value;
+    }
+    // With no edits, Apply explicitly reconciles and saves the current policy.
+    if (!Object.keys(patch).length) patch.enabled = shieldBaseline.enabled;
+    await applyDdsShield(ag.agent_id, patch);
   }
 
   // ---------------- Egress & Ingress Tables ----------------
@@ -261,8 +471,8 @@
     tbody.innerHTML = state.draftEgress
       .map((r, idx) => {
         const boundNote = r.resolved_type
-          ? `<div class="muted" style="font-size:10px">${escapeHtml(r.resolved_type)}</div>`
-          : '<div class="muted" style="font-size:10px">等待本机发布...</div>';
+          ? `<div class="muted resolved-type" style="font-size:10px">${escapeHtml(r.resolved_type)}</div>`
+          : '<div class="muted resolved-type" style="font-size:10px">等待本机发布...</div>';
         return `
           <tr data-idx="${idx}">
             <td style="text-align:center"><input type="checkbox" class="eg-enabled" ${r.enabled ? 'checked' : ''} /></td>
@@ -288,37 +498,6 @@
           </tr>`;
       })
       .join('');
-
-    tbody.querySelectorAll('tr').forEach((tr) => {
-      const idx = Number(tr.getAttribute('data-idx'));
-      const bind = (sel, field, fn) => {
-        const el = tr.querySelector(sel);
-        if (!el) return;
-        el.addEventListener('change', () => {
-          state.draftEgress[idx][field] = fn(el);
-          setDirty(true);
-        });
-      };
-      bind('.eg-enabled', 'enabled', (el) => el.checked);
-      bind('.eg-topic', 'topic', (el) => el.value.trim());
-      bind('.eg-zkey', 'zenoh_key', (el) => el.value.trim());
-      bind('.eg-freq', 'max_freq', (el) => parseFloat(el.value) || 0);
-      bind('.eg-kbps', 'max_kbps', (el) => parseFloat(el.value) || 0);
-      bind('.eg-ondemand', 'on_demand', (el) => el.checked);
-      bind('.eg-prio', 'priority', (el) => el.value);
-      bind('.eg-cong', 'congestion', (el) => el.value);
-      bind('.eg-express', 'express', (el) => el.checked);
-      bind('.eg-rel', 'reliability', (el) => el.value);
-      bind('.eg-loc', 'locality', (el) => el.value);
-      bind('.eg-qos', 'qos', (el) => el.value);
-      bind('.eg-depth', 'history_depth', (el) => parseInt(el.value, 10) || 10);
-
-      tr.querySelector('.eg-del')?.addEventListener('click', () => {
-        state.draftEgress.splice(idx, 1);
-        setDirty(true);
-        renderEgressTable();
-      });
-    });
   }
 
   function renderIngressTable() {
@@ -347,32 +526,6 @@
           </tr>`;
       })
       .join('');
-
-    tbody.querySelectorAll('tr').forEach((tr) => {
-      const idx = Number(tr.getAttribute('data-idx'));
-      const bind = (sel, field, fn) => {
-        const el = tr.querySelector(sel);
-        if (!el) return;
-        el.addEventListener('change', () => {
-          state.draftIngress[idx][field] = fn(el);
-          setDirty(true);
-        });
-      };
-      bind('.ig-enabled', 'enabled', (el) => el.checked);
-      bind('.ig-pat', 'pattern', (el) => el.value.trim());
-      bind('.ig-remap', 'remap_prefix', (el) => el.value.trim());
-      bind('.ig-excl', 'exclude_self', (el) => el.checked);
-      bind('.ig-freq', 'max_freq', (el) => parseFloat(el.value) || 0);
-      bind('.ig-loc', 'locality', (el) => el.value);
-      bind('.ig-qos', 'qos', (el) => el.value);
-      bind('.ig-depth', 'history_depth', (el) => parseInt(el.value, 10) || 10);
-
-      tr.querySelector('.ig-del')?.addEventListener('click', () => {
-        state.draftIngress.splice(idx, 1);
-        setDirty(true);
-        renderIngressTable();
-      });
-    });
   }
 
   function updateLiveMetricCellsOnly() {
@@ -436,6 +589,7 @@
   }
 
   function renderDiscovery() {
+    if (state.activeTab !== 'discovery') return;
     const ag = getSelectedAgent();
     const tbody = $('discoveryTbody');
     if (!ag) {
@@ -486,197 +640,48 @@
 
   // ---------------- Zenoh Kernel & Bridge Settings ----------------
 
-  function populateSessionForm(c) {
-    setConfigMode(c.config_mode || 'structured');
-    $('sessRawJson5').value = c.raw_json5 || '';
+  const sessionFields = document.querySelectorAll('[data-session-key]');
 
-    // Group 1
-    $('sessMode').value = c.mode || 'peer';
-    $('sessCustomZid').value = c.custom_zid || '';
-    $('sessNamespace').value = c.zenoh_namespace || '';
-    $('sessQueriesTimeout').value = c.queries_default_timeout_ms ?? 10000;
-    $('sessConnect').value = (c.connect_endpoints || []).join('\n');
-    $('sessConnectTimeout').value = c.connect_timeout_ms ?? 0;
-    $('sessConnectExitFail').checked = Boolean(c.connect_exit_on_failure);
-    $('sessListen').value = (c.listen_endpoints || []).join('\n');
-    $('sessListenTimeout').value = c.listen_timeout_ms ?? 0;
-    $('sessListenExitFail').checked = Boolean(c.listen_exit_on_failure);
-    $('sessMetadataJson5').value = c.metadata_json5 || '';
+  function parseLines(text) {
+    return text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  }
 
-    // Group 2
-    $('sessScoutTimeout').value = c.scouting_timeout_ms ?? 3000;
-    $('sessScoutDelay').value = c.scouting_delay_ms ?? 500;
-    $('sessMcastAddr').value = c.multicast_address || '224.0.0.224:7446';
-    $('sessMcastIface').value = c.multicast_interface || 'auto';
-    $('sessMcastTtl').value = c.multicast_ttl ?? 1;
-    $('sessMcastEn').checked = c.multicast_enabled !== false;
-    $('sessMcastListen').checked = c.multicast_listen !== false;
-    $('sessGossipEn').checked = c.gossip_enabled !== false;
-    $('sessGossipMulti').checked = Boolean(c.gossip_multihop);
-
-    // Group 3
-    $('sessLowLatency').checked = Boolean(c.unicast_lowlatency);
-    $('sessUnicastQos').checked = c.unicast_qos_enabled !== false;
-    $('sessCompression').checked = Boolean(c.compression_enabled);
-    $('sessBatching').checked = c.batching_enabled !== false;
-    $('sessMcastQos').checked = Boolean(c.multicast_qos_enabled);
-    $('sessMcastComp').checked = Boolean(c.multicast_compression_enabled);
-    $('sessMaxSessions').value = c.unicast_max_sessions ?? 1000;
-    $('sessMaxLinks').value = c.unicast_max_links ?? 1;
-    $('sessOpenTimeout').value = c.unicast_open_timeout ?? 10000;
-    $('sessAcceptTimeout').value = c.unicast_accept_timeout ?? 10000;
-    $('sessLeaseMs').value = c.lease_ms ?? 10000;
-    $('sessKeepAlive').value = c.keep_alive ?? 4;
-    $('sessTxBatchSize').value = c.tx_batch_size ?? 65535;
-    $('sessBatchTimeLimit').value = c.batching_time_limit_ms ?? 1;
-    $('sessTxThreads').value = c.tx_threads ?? 0;
-    $('sessMcastJoinInt').value = c.multicast_join_interval ?? 2500;
-    $('sessRxBufSize').value = c.rx_buffer_size ?? 65535;
-    $('sessRxMaxMsg').value = c.rx_max_message_size ?? 1073741824;
-    $('sessTcpSndBuf').value = c.tcp_so_sndbuf ?? 0;
-    $('sessTcpRcvBuf').value = c.tcp_so_rcvbuf ?? 0;
-    $('sessTxQueueJson5').value = c.tx_queue_json5 || '';
-
-    // Group 4: SHM
-    $('sessShm').checked = Boolean(c.shared_memory_enabled);
-    $('sessShmOpt').checked = c.shm_opt_enabled !== false;
-    $('sessShmMode').value = c.shm_mode || 'lazy';
-    $('sessShmPoolSize').value = c.shm_pool_size ?? 16777216;
-    $('sessShmThreshold').value = c.shm_message_threshold ?? 3072;
-
-    // Group 5: Security
-    $('sessTlsRootCa').value = c.tls_root_ca || '';
-    $('sessTlsListenCert').value = c.tls_listen_cert || '';
-    $('sessTlsListenKey').value = c.tls_listen_key || '';
-    $('sessTlsConnectCert').value = c.tls_connect_cert || '';
-    $('sessTlsConnectKey').value = c.tls_connect_key || '';
-    $('sessTlsMtls').checked = Boolean(c.tls_enable_mtls);
-    $('sessTlsVerifyName').checked = c.tls_verify_name !== false;
-    $('sessAuthUser').value = c.auth_user || '';
-    $('sessAuthPass').value = c.auth_password || '';
-    $('sessAuthDict').value = c.auth_dictionary_file || '';
-    $('sessAuthPubKey').value = c.auth_pubkey_file || '';
-    $('sessAuthPrivKey').value = c.auth_privkey_file || '';
-    $('sessAuthKnownKeys').value = c.auth_known_keys_file || '';
-    $('sessAclEnabled').checked = Boolean(c.acl_enabled);
-    $('sessAclDefaultPerm').value = c.acl_default_permission || 'deny';
-    $('sessAclJson5').value = c.acl_json5 || '';
-
-    // Group 6: Routing, AdminSpace, Flow Control & Plugins
-    $('sessTimestamp').checked = Boolean(c.timestamping_enabled);
-    $('sessDropFutureTs').checked = Boolean(c.drop_future_timestamp);
-    $('sessFailoverBroker').checked = c.peers_failover_brokering !== false;
-    $('sessAdminEn').checked = Boolean(c.adminspace_enabled);
-    $('sessAdminRead').checked = c.adminspace_read !== false;
-    $('sessAdminWrite').checked = Boolean(c.adminspace_write);
-    $('sessPluginsLoad').checked = Boolean(c.plugins_loading_enabled);
-    $('sessPeerRoutingMode').value = c.peer_routing_mode || 'peer_to_peer';
-    $('sessDownsampling').value = c.downsampling_json5 || '';
-    $('sessLowPass').value = c.low_pass_filter_json5 || '';
-    $('sessQosPub').value = c.qos_publication_json5 || '';
-    $('sessQosNet').value = c.qos_network_json5 || '';
-    $('sessAggregation').value = c.aggregation_json5 || '';
-    $('sessPluginsJson5').value = c.plugins_json5 || '';
-
-    // Group 7: True JSON5 Override
-    $('sessCustomJson').value = c.custom_json5 || '';
+  function populateSessionForm(config) {
+    setConfigMode(config.config_mode || 'structured');
+    for (const field of sessionFields) {
+      const value = config[field.dataset.sessionKey];
+      const fallback = field.dataset.default || '';
+      if (field.type === 'checkbox') {
+        field.checked = fallback === 'true' ? value !== false : Boolean(value);
+      } else if (field.dataset.format === 'lines') {
+        field.value = (value || []).join('\n');
+      } else if (field.type === 'number') {
+        field.value = value ?? fallback;
+      } else {
+        field.value = value || fallback;
+      }
+    }
   }
 
   function collectSessionConfigFromForm() {
-    const parseLines = (txt) => txt.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-    const numVal = (id, fallback) => {
-      const v = parseInt($(id).value, 10);
-      return Number.isFinite(v) ? v : fallback;
-    };
-    return {
-      config_mode: state.configMode,
-      raw_json5: $('sessRawJson5').value,
-
-      custom_zid: $('sessCustomZid').value.trim(),
-      zenoh_namespace: $('sessNamespace').value.trim(),
-      metadata_json5: $('sessMetadataJson5').value.trim(),
-      mode: $('sessMode').value,
-      connect_endpoints: parseLines($('sessConnect').value),
-      connect_timeout_ms: numVal('sessConnectTimeout', 0),
-      connect_exit_on_failure: $('sessConnectExitFail').checked,
-      listen_endpoints: parseLines($('sessListen').value),
-      listen_timeout_ms: numVal('sessListenTimeout', 0),
-      listen_exit_on_failure: $('sessListenExitFail').checked,
-      queries_default_timeout_ms: numVal('sessQueriesTimeout', 10000),
-
-      scouting_timeout_ms: numVal('sessScoutTimeout', 3000),
-      scouting_delay_ms: numVal('sessScoutDelay', 500),
-      multicast_enabled: $('sessMcastEn').checked,
-      multicast_address: $('sessMcastAddr').value.trim(),
-      multicast_interface: $('sessMcastIface').value.trim() || 'auto',
-      multicast_ttl: numVal('sessMcastTtl', 1),
-      multicast_listen: $('sessMcastListen').checked,
-      gossip_enabled: $('sessGossipEn').checked,
-      gossip_multihop: $('sessGossipMulti').checked,
-
-      unicast_lowlatency: $('sessLowLatency').checked,
-      unicast_qos_enabled: $('sessUnicastQos').checked,
-      compression_enabled: $('sessCompression').checked,
-      unicast_max_sessions: numVal('sessMaxSessions', 1000),
-      unicast_max_links: numVal('sessMaxLinks', 1),
-      unicast_open_timeout: numVal('sessOpenTimeout', 10000),
-      unicast_accept_timeout: numVal('sessAcceptTimeout', 10000),
-      multicast_qos_enabled: $('sessMcastQos').checked,
-      multicast_compression_enabled: $('sessMcastComp').checked,
-      multicast_join_interval: numVal('sessMcastJoinInt', 2500),
-      lease_ms: numVal('sessLeaseMs', 10000),
-      keep_alive: numVal('sessKeepAlive', 4),
-      tx_batch_size: numVal('sessTxBatchSize', 65535),
-      tx_threads: numVal('sessTxThreads', 0),
-      batching_enabled: $('sessBatching').checked,
-      batching_time_limit_ms: numVal('sessBatchTimeLimit', 1),
-      rx_buffer_size: numVal('sessRxBufSize', 65535),
-      rx_max_message_size: numVal('sessRxMaxMsg', 1073741824),
-      tcp_so_sndbuf: numVal('sessTcpSndBuf', 0),
-      tcp_so_rcvbuf: numVal('sessTcpRcvBuf', 0),
-      tx_queue_json5: $('sessTxQueueJson5').value.trim(),
-
-      shared_memory_enabled: $('sessShm').checked,
-      shm_mode: $('sessShmMode').value,
-      shm_opt_enabled: $('sessShmOpt').checked,
-      shm_pool_size: numVal('sessShmPoolSize', 16777216),
-      shm_message_threshold: numVal('sessShmThreshold', 3072),
-
-      timestamping_enabled: $('sessTimestamp').checked,
-      drop_future_timestamp: $('sessDropFutureTs').checked,
-
-      tls_root_ca: $('sessTlsRootCa').value.trim(),
-      tls_listen_key: $('sessTlsListenKey').value.trim(),
-      tls_listen_cert: $('sessTlsListenCert').value.trim(),
-      tls_enable_mtls: $('sessTlsMtls').checked,
-      tls_connect_key: $('sessTlsConnectKey').value.trim(),
-      tls_connect_cert: $('sessTlsConnectCert').value.trim(),
-      tls_verify_name: $('sessTlsVerifyName').checked,
-      auth_user: $('sessAuthUser').value.trim(),
-      auth_password: $('sessAuthPass').value,
-      auth_dictionary_file: $('sessAuthDict').value.trim(),
-      auth_pubkey_file: $('sessAuthPubKey').value.trim(),
-      auth_privkey_file: $('sessAuthPrivKey').value.trim(),
-      auth_known_keys_file: $('sessAuthKnownKeys').value.trim(),
-      acl_enabled: $('sessAclEnabled').checked,
-      acl_default_permission: $('sessAclDefaultPerm').value,
-      acl_json5: $('sessAclJson5').value.trim(),
-
-      peers_failover_brokering: $('sessFailoverBroker').checked,
-      peer_routing_mode: $('sessPeerRoutingMode').value,
-      adminspace_enabled: $('sessAdminEn').checked,
-      adminspace_read: $('sessAdminRead').checked,
-      adminspace_write: $('sessAdminWrite').checked,
-      downsampling_json5: $('sessDownsampling').value.trim(),
-      low_pass_filter_json5: $('sessLowPass').value.trim(),
-      qos_publication_json5: $('sessQosPub').value.trim(),
-      qos_network_json5: $('sessQosNet').value.trim(),
-      aggregation_json5: $('sessAggregation').value.trim(),
-      plugins_loading_enabled: $('sessPluginsLoad').checked,
-      plugins_json5: $('sessPluginsJson5').value.trim(),
-
-      custom_json5: $('sessCustomJson').value.trim(),
-    };
+    const config = { config_mode: state.configMode };
+    for (const field of sessionFields) {
+      const { sessionKey, format } = field.dataset;
+      let value = field.value;
+      if (field.type === 'checkbox') {
+        value = field.checked;
+      } else if (field.type === 'number') {
+        const parsed = parseInt(value, 10);
+        value = Number.isFinite(parsed) ? parsed : Number(field.dataset.default);
+      } else if (format === 'lines') {
+        value = parseLines(value);
+      } else if (format !== 'raw' && field.type !== 'password' && field.tagName !== 'SELECT') {
+        value = value.trim();
+        if (sessionKey === 'multicast_interface' && !value) value = field.dataset.default;
+      }
+      config[sessionKey] = value;
+    }
+    return config;
   }
 
   function renderTransportsAndLinks(transports, links) {
@@ -727,10 +732,30 @@
     }
   }
 
-  async function loadZenohInfo(forceFormReload = false) {
+  let infoRequest;
+  function invalidateSessionInfo() {
+    state.sessionLoadedForAgent = '';
+    infoRequest = null;  // Ignore any response from before this selection or settings change.
+  }
+
+  function loadZenohInfo(forceFormReload = false) {
     const target = state.selectedAgentId || state.localAgentId;
+    if (infoRequest?.target === target) {
+      infoRequest.reload ||= forceFormReload;
+      return infoRequest.promise;
+    }
+    const request = infoRequest = { target, reload: forceFormReload };
+    request.promise = refreshZenohInfo(request).finally(() => {
+      if (infoRequest === request) infoRequest = null;
+    });
+    return request.promise;
+  }
+
+  async function refreshZenohInfo(request) {
+    const { target } = request;
     const qs = target ? `?agent_id=${encodeURIComponent(target)}` : '';
     const res = await api(`/zenoh/info${qs}`);
+    if (infoRequest !== request) return;
     if (!res.ok) {
       toast(`获取 ${target || '节点'} 内核配置失败: ${res.message || '未知错误'}`, 'err');
       return;
@@ -754,7 +779,7 @@
     state.lastEffectiveConfigText = effText;
     $('effectiveConfigPre').textContent = effText;
 
-    if (forceFormReload || state.sessionLoadedForAgent !== target) {
+    if (request.reload || state.sessionLoadedForAgent !== target) {
       if (res.default_agent_id) {
         $('bsDefaultAgentHint').textContent = res.default_agent_id;
       }
@@ -790,13 +815,13 @@
     const res = await api('/bridge/settings', { method: 'POST', body: JSON.stringify(payload) });
     if (res.ok) {
       toast(res.message || '桥接设置已保存并热生效', 'ok');
-      state.sessionLoadedForAgent = '';
+      invalidateSessionInfo();
       if (target === state.localAgentId && res.agent_id) {
-        state.selectedAgentId = res.agent_id;
+        selectAgent(res.agent_id);
       }
       setTimeout(async () => {
         await pollAgents();
-        await loadZenohInfo(true);
+        if (state.sessionLoadedForAgent !== state.selectedAgentId) await loadZenohInfo(true);
       }, 300);
     } else {
       toast(res.message || '保存桥接设置失败', 'err');
@@ -829,7 +854,7 @@
     if (res.ok) {
       showValidateBox(true, `✓ ${res.message || 'Zenoh Session 已热重连'}`);
       toast(res.message || 'Zenoh Session 已热重连', 'ok');
-      state.sessionLoadedForAgent = '';
+      invalidateSessionInfo();
       setTimeout(async () => {
         await loadZenohInfo(true);
         await pollAgents();
@@ -881,7 +906,7 @@
       btn.addEventListener('click', () => {
         const loc = btn.getAttribute('data-loc');
         if (!loc) return;
-        const cur = $('sessConnect').value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+        const cur = parseLines($('sessConnect').value);
         if (!cur.includes(loc)) {
           cur.push(loc);
           $('sessConnect').value = cur.join('\n');
@@ -951,11 +976,19 @@
   // ---------------- Live Logs ----------------
 
   async function pollLogs() {
-    if (!state.selectedAgentId) return;
+    const agentId = state.selectedAgentId;
+    if (!agentId) return;
+    const requestId = ++logRequestId;
     try {
-      const res = await api(`/logs?agent_id=${encodeURIComponent(state.selectedAgentId)}`);
-      if (!res.ok) return;
-      state.logsCache = res.logs || [];
+      const res = await api(`/logs?agent_id=${encodeURIComponent(agentId)}`);
+      if (!res.ok || agentId !== state.selectedAgentId || requestId <= lastAppliedLogRequest) return;
+      lastAppliedLogRequest = requestId;
+      const logs = res.logs || [];
+      if (state.logsCache && logs.length === state.logsCache.length && logs.every((entry, i) => {
+        const old = state.logsCache[i];
+        return entry.timestamp_ms === old.timestamp_ms && entry.level === old.level && entry.message === old.message;
+      })) return;
+      state.logsCache = logs;
       renderLogs();
     } catch (_) {}
   }
@@ -963,7 +996,7 @@
   function renderLogs() {
     const tbody = $('logsTbody');
     const filter = $('logLevelFilter').value;
-    const rows = state.logsCache.filter((l) => {
+    const rows = (state.logsCache || []).filter((l) => {
       if (filter === 'ERROR') return l.level === 'ERROR';
       if (filter === 'WARN') return l.level === 'ERROR' || l.level === 'WARN';
       return true;
@@ -988,7 +1021,41 @@
 
   // ---------------- Event Wiring ----------------
 
+  function bindRuleTable(tbody, draftKey, fields, deleteClass, render) {
+    tbody.addEventListener('change', ({ target }) => {
+      const fieldClass = Array.from(target.classList).find((name) => fields[name]);
+      if (!fieldClass) return;
+      const field = fields[fieldClass];
+      let value = target.value;
+      if (target.type === 'checkbox') value = target.checked;
+      else if (field === 'history_depth') value = parseInt(value, 10) || 10;
+      else if (target.type === 'number') value = parseFloat(value) || 0;
+      else if (target.type === 'text') value = value.trim();
+      if (target.type === 'number' || target.type === 'text') target.value = String(value);
+      state[draftKey][target.closest('tr').dataset.idx][field] = value;
+      setDirty(true);
+    });
+    tbody.addEventListener('click', ({ target }) => {
+      const button = target.closest(deleteClass);
+      if (!button) return;
+      state[draftKey].splice(Number(button.closest('tr').dataset.idx), 1);
+      setDirty(true);
+      render();
+    });
+  }
+
+  function downloadJson(text, filename) {
+    const link = document.createElement('a');
+    const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+    link.href = url;
+    link.download = filename;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+
   function initEvents() {
+    bindRuleTable($('egressTbody'), 'draftEgress', EGRESS_FIELDS, '.eg-del', renderEgressTable);
+    bindRuleTable($('ingressTbody'), 'draftIngress', INGRESS_FIELDS, '.ig-del', renderIngressTable);
     $('mainTabs').querySelectorAll('.tab').forEach((btn) => {
       btn.addEventListener('click', () => {
         const target = btn.getAttribute('data-tab');
@@ -999,21 +1066,26 @@
         $(`tab-${target}`).classList.add('active');
         if (target === 'session') loadZenohInfo(false);
         if (target === 'logs') pollLogs();
+        if (target === 'discovery') renderDiscovery();
       });
     });
 
     $('logLevelFilter').addEventListener('change', renderLogs);
     $('btnRefreshLogs').addEventListener('click', pollLogs);
     $('btnClearLogs').addEventListener('click', async () => {
-      if (!state.selectedAgentId) return;
+      const agentId = state.selectedAgentId;
+      if (!agentId) return;
       const res = await api('/logs/clear', {
         method: 'POST',
-        body: JSON.stringify({ agent_id: state.selectedAgentId }),
+        body: JSON.stringify({ agent_id: agentId }),
       });
       if (res.ok) {
-        state.logsCache = [];
-        renderLogs();
-        toast(`已清空 ${state.selectedAgentId} 的日志`, 'ok');
+        if (state.selectedAgentId === agentId) {
+          lastAppliedLogRequest = logRequestId;
+          state.logsCache = [];
+          renderLogs();
+        }
+        toast(`已清空 ${agentId} 的日志`, 'ok');
         pollAgents();
       }
     });
@@ -1063,14 +1135,8 @@
     $('btnApplySave').addEventListener('click', () => submitRules(true));
 
     $('btnExportRules').addEventListener('click', () => {
-      const blob = new Blob(
-        [JSON.stringify({ egress: state.draftEgress, ingress: state.draftIngress }, null, 2)],
-        { type: 'application/json' }
-      );
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = `zenoh-rules-${state.selectedAgentId || 'agent'}.json`;
-      a.click();
+      const text = JSON.stringify({ egress: state.draftEgress, ingress: state.draftIngress }, null, 2);
+      downloadJson(text, `zenoh-rules-${state.selectedAgentId || 'agent'}.json`);
     });
 
     $('btnImportRules').addEventListener('click', () => $('importFileInput').click());
@@ -1132,6 +1198,8 @@
     });
 
     // Session & Bridge Settings events
+    $('btnDdsShieldPill').addEventListener('click', toggleDdsShieldForSelected);
+    $('btnCoreShieldApply').addEventListener('click', applyCoreShieldBar);
     $('btnRefreshInfo').addEventListener('click', () => loadZenohInfo(true));
     $('btnSaveBridgeSettings').addEventListener('click', saveBridgeSettings);
     $('btnModeStructured').addEventListener('click', () => setConfigMode('structured'));
@@ -1173,11 +1241,7 @@
     });
     $('btnRawExport').addEventListener('click', () => {
       const txt = $('sessRawJson5').value || state.lastEffectiveConfigText || '{}';
-      const blob = new Blob([txt], { type: 'application/json' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = `zenoh-config-${state.selectedAgentId || 'agent'}.json5`;
-      a.click();
+      downloadJson(txt, `zenoh-config-${state.selectedAgentId || 'agent'}.json5`);
     });
     $('btnCopyEffective').addEventListener('click', async () => {
       try {
@@ -1298,6 +1362,6 @@
 
   initEvents();
   pollAgents();
-  setInterval(pollAgents, 1500);
+  setInterval(() => { if (!currentPoll) pollAgents(); }, 1500);
   setInterval(pollSniffer, 1000);
 })();

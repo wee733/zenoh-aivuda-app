@@ -9,9 +9,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
+#include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -23,10 +27,9 @@ namespace zenoh_bridge {
 struct HttpRequest {
   std::string method;
   std::string path;
-  std::string query_string;
   std::map<std::string, std::string> query_params;
-  std::map<std::string, std::string> headers;
   std::string body;
+  bool shield_admin{false};  // Header verified by the HTTP transport; never accepted from JSON/RPC.
 };
 
 struct HttpResponse {
@@ -86,14 +89,15 @@ public:
     if (!running_.exchange(false)) {
       return;
     }
-    if (listen_fd_ >= 0) {
-      ::shutdown(listen_fd_, SHUT_RDWR);
-      ::close(listen_fd_);
-      listen_fd_ = -1;
-    }
-    if (accept_thread_.joinable()) {
-      accept_thread_.join();
-    }
+    ::shutdown(listen_fd_, SHUT_RDWR);
+    if (accept_thread_.joinable()) accept_thread_.join();
+    ::close(listen_fd_);
+    listen_fd_ = -1;
+    // A policy writer may still be committing/rolling back. Do not destroy
+    // its node or release the installation lock until the request finishes.
+    std::unique_lock<std::mutex> lk(workers_mutex_);
+    for (int fd : clients_) ::shutdown(fd, SHUT_RDWR);  // Wake workers still reading a request.
+    workers_done_.wait(lk, [this] { return clients_.empty(); });
   }
 
   bool isRunning() const { return running_.load(); }
@@ -139,8 +143,10 @@ private:
       case 200: return "OK";
       case 204: return "No Content";
       case 400: return "Bad Request";
+      case 403: return "Forbidden";
       case 404: return "Not Found";
       case 405: return "Method Not Allowed";
+      case 409: return "Conflict";
       case 500: return "Internal Server Error";
       case 503: return "Service Unavailable";
       default: return "OK";
@@ -156,7 +162,20 @@ private:
         if (!running_.load()) break;
         continue;
       }
-      std::thread([this, fd]() { handleClient(fd); }).detach();
+      std::lock_guard<std::mutex> lk(workers_mutex_);
+      clients_.insert(fd);
+      try {
+        std::thread([this, fd] {
+          try { handleClient(fd); } catch (...) { /* Drop the connection. */ }
+          std::lock_guard<std::mutex> done(workers_mutex_);
+          clients_.erase(fd);
+          ::close(fd);
+          if (clients_.empty()) workers_done_.notify_all();
+        }).detach();
+      } catch (const std::system_error &) {
+        clients_.erase(fd);
+        ::close(fd);
+      }
     }
   }
 
@@ -172,6 +191,8 @@ private:
     char buf[4096];
     size_t header_end = std::string::npos;
     size_t content_length = 0;
+    HttpRequest req;
+    bool saw_shield_token = false;
 
     while (raw.size() < 4 * 1024 * 1024) {
       ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
@@ -190,7 +211,14 @@ private:
               std::string k = line.substr(0, colon);
               std::transform(k.begin(), k.end(), k.begin(),
                              [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-              if (k == "content-length") {
+              if (k == "x-dds-shield-token") {
+                const char *secret = std::getenv("ZENOH_BRIDGE_SHIELD_TOKEN");
+                const size_t start = line.find_first_not_of(" \t", colon + 1);
+                const size_t end = line.find_last_not_of(" \t");
+                req.shield_admin = !saw_shield_token && secret && *secret && start != std::string::npos &&
+                                  line.compare(start, end - start + 1, secret) == 0;
+                saw_shield_token = true;
+              } else if (k == "content-length") {
                 std::string v = line.substr(colon + 1);
                 try {
                   content_length = static_cast<size_t>(std::stoull(v));
@@ -207,12 +235,9 @@ private:
       }
     }
 
-    if (header_end == std::string::npos) {
-      ::close(fd);
-      return;
-    }
+    // Do not dispatch a buffered request once stop() has started draining handlers.
+    if (!isRunning() || header_end == std::string::npos || raw.size() - header_end - 4 < content_length) return;
 
-    HttpRequest req;
     std::istringstream hs(raw.substr(0, header_end));
     std::string request_line;
     std::getline(hs, request_line);
@@ -224,23 +249,9 @@ private:
       const size_t qpos = target.find('?');
       if (qpos != std::string::npos) {
         req.path = target.substr(0, qpos);
-        req.query_string = target.substr(qpos + 1);
-        parseQuery(req.query_string, req.query_params);
+        parseQuery(target.substr(qpos + 1), req.query_params);
       } else {
         req.path = target;
-      }
-    }
-    std::string hline;
-    while (std::getline(hs, hline)) {
-      if (!hline.empty() && hline.back() == '\r') hline.pop_back();
-      const size_t colon = hline.find(':');
-      if (colon != std::string::npos) {
-        std::string k = hline.substr(0, colon);
-        std::string v = hline.substr(colon + 1);
-        std::transform(k.begin(), k.end(), k.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(v.begin());
-        req.headers[k] = v;
       }
     }
     req.body = raw.substr(header_end + 4, content_length);
@@ -279,12 +290,14 @@ private:
       if (n <= 0) break;
       sent += static_cast<size_t>(n);
     }
-    ::close(fd);
   }
 
   int listen_fd_{-1};
   std::atomic<bool> running_{false};
   std::thread accept_thread_;
+  std::mutex workers_mutex_;
+  std::condition_variable workers_done_;
+  std::set<int> clients_;
   Handler handler_;
 };
 

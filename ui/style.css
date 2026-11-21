@@ -65,13 +65,8 @@ html, body {
 .brand-logo {
   width: 32px;
   height: 32px;
-  border-radius: 8px;
-  background: linear-gradient(135deg, #0ea5e9, #22d3ee);
-  color: #082f49;
-  font-weight: 800;
-  font-size: 18px;
-  display: grid;
-  place-items: center;
+  flex-shrink: 0;
+  object-fit: contain;
 }
 
 .brand-title {
@@ -712,4 +707,62 @@ html, body {
   font-weight: 600;
   color: #cbd5e1;
   margin: 12px 0 6px;
+}
+
+/* v2.2 DDS Shield Pill */
+.shield-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text);
+  transition: all 0.15s;
+}
+.shield-pill.active {
+  background: rgba(34, 197, 94, 0.14);
+  border-color: rgba(34, 197, 94, 0.5);
+  color: #86efac;
+}
+.shield-pill.inactive {
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(245, 158, 11, 0.5);
+  color: #fcd34d;
+}
+.shield-pill:hover {
+  filter: brightness(1.12);
+}
+
+/* Core DDS Shield Bar */
+.shield-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+}
+.shield-bar.active {
+  border-color: rgba(34, 197, 94, 0.5);
+  background: rgba(34, 197, 94, 0.06);
+}
+.shield-bar-left, .shield-bar-right {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.shield-pill.neutral {
+  background: var(--bg-card);
+  border-color: var(--border);
+  color: var(--text-muted);
 }

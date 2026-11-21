@@ -4,24 +4,8 @@ set -euo pipefail
 APP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 echo "[pre_install] Building zenoh_bridge_node in ${APP_ROOT}"
 
-find_ros_setup() {
-  for d in jazzy lyrical kilted humble; do
-    if [[ -f "/opt/ros/${d}/setup.bash" ]]; then
-      echo "/opt/ros/${d}/setup.bash"
-      return 0
-    fi
-  done
-  return 1
-}
-
-ROS_SETUP=""
-if [[ -n "${ROS_DISTRO:-}" && -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]]; then
-  ROS_SETUP="/opt/ros/${ROS_DISTRO}/setup.bash"
-else
-  ROS_SETUP="$(find_ros_setup || true)"
-fi
-
-if [[ -z "${ROS_SETUP}" ]]; then
+source "${APP_ROOT}/scripts/ros_setup.sh"
+if ! ROS_SETUP="$(find_ros_setup '' "${ROS_DISTRO:-}")"; then
   echo "[pre_install] ERROR: No ROS 2 installation found under /opt/ros/{jazzy,lyrical,kilted,humble}." >&2
   exit 1
 fi

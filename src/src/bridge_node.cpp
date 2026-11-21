@@ -1,4 +1,6 @@
 #include "zenoh_bridge/bridge_node.hpp"
+#include "zenoh_bridge/config_file.hpp"
+#include "zenoh_bridge/dds_shield.hpp"
 
 #include <unistd.h>
 
@@ -9,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <sstream>
 #include <thread>
@@ -47,6 +50,19 @@ std::string trimWhitespace(std::string s) {
   s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
   s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
   return s;
+}
+
+constexpr const char *kShieldFields[] = {"dds_shield_enabled", "dds_shield_scope", "dds_shield_domains"};
+constexpr const char *kShieldWriteDenied = "DDS Shield changes require authenticated local management";
+
+bool shieldPolicyChanged(const BridgeSettings &a, const BridgeSettings &b) {
+  return a.dds_shield_enabled != b.dds_shield_enabled || a.dds_shield_scope != b.dds_shield_scope ||
+         a.dds_shield_domains != b.dds_shield_domains;
+}
+
+bool hasShieldFields(const nlohmann::json &patch) {
+  return std::any_of(std::begin(kShieldFields), std::end(kShieldFields),
+                     [&](const char *key) { return patch.contains(key); });
 }
 
 std::string reliabilityToStr(rclcpp::ReliabilityPolicy r) {
@@ -110,26 +126,59 @@ void mergeJsonDiffIntoZenohConfig(zenoh::Config &cfg,
   }
 }
 
-void atomicWriteFile(const std::string &path, const std::string &content) {
-  const std::string tmp = path + ".tmp";
-  {
-    std::ofstream ofs(tmp, std::ios::out | std::ios::trunc);
-    if (!ofs.is_open()) {
-      throw std::runtime_error("Failed to open temp file for writing: " + tmp);
-    }
-    ofs << content;
-    ofs.flush();
-    if (!ofs.good()) {
-      ofs.close();
-      std::remove(tmp.c_str());
-      throw std::runtime_error("Failed writing file: " + tmp);
-    }
-  }
-  if (std::rename(tmp.c_str(), path.c_str()) != 0) {
-    std::remove(tmp.c_str());
-    throw std::runtime_error("Failed to atomically replace file: " + path);
-  }
+// Zero or omission selects our bounded endpoint default, not the session's
+// configurable timeout. Check the JSON type before converting to unsigned.
+std::optional<uint64_t> httpQueryTimeout(const nlohmann::json &body, uint64_t fallback) {
+  const auto it = body.find("timeout_ms");
+  if (it == body.end()) return fallback;
+  if (!it->is_number_integer() || (!it->is_number_unsigned() && it->get<int64_t>() < 0)) return std::nullopt;
+  const auto value = it->get<uint64_t>();
+  if (value > 10000) return std::nullopt;
+  return value == 0 ? fallback : value;
 }
+constexpr auto kTimeoutError = "timeout_ms must be an integer from 0 to 10000 (0 selects the default)";
+
+// Local replies may arrive inline, before get() returns: blocking a Zenoh
+// callback on a full FIFO would prevent the worker from ever draining it.
+class HttpReplies : public std::enable_shared_from_this<HttpReplies> {
+public:
+  auto onReply() {
+    return [weak = weak_from_this()](const zenoh::Reply &reply) {
+      if (auto self = weak.lock()) {
+        std::lock_guard<std::mutex> lock(self->mutex_);
+        if (self->queue_.size() == 4096) self->overflow_ = true;
+        else if (!self->overflow_) self->queue_.push_back(reply.clone());
+        self->ready_.notify_one();
+      }
+    };
+  }
+  auto onDone() {
+    return [weak = weak_from_this()] {
+      if (auto self = weak.lock()) {
+        std::lock_guard<std::mutex> lock(self->mutex_);
+        self->done_ = true;
+        self->ready_.notify_one();
+      }
+    };
+  }
+  std::optional<zenoh::Reply> next(const MiniHttpServer &server) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (server.isRunning() && queue_.empty() && !done_ && !overflow_)
+      ready_.wait_for(lock, std::chrono::milliseconds(50));
+    if (!server.isRunning()) throw std::runtime_error("HTTP server is stopping");
+    if (overflow_) throw std::runtime_error("Too many pending query replies");
+    if (queue_.empty()) return std::nullopt;
+    auto reply = std::move(queue_.front());
+    queue_.pop_front();
+    return reply;
+  }
+private:
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  std::deque<zenoh::Reply> queue_;
+  bool done_{false};
+  bool overflow_{false};
+};
 
 std::vector<std::string> copyHelloLocatorsSafe(const zenoh::Hello &hello) {
   std::vector<std::string> out_vec;
@@ -148,7 +197,7 @@ std::vector<std::string> copyHelloLocatorsSafe(const zenoh::Hello &hello) {
 
 }  // namespace
 
-ZenohBridgeNode::ZenohBridgeNode(const rclcpp::NodeOptions &options)
+ZenohBridgeNode::ZenohBridgeNode(const StartupConfig &startup, const rclcpp::NodeOptions &options)
     : rclcpp::Node("zenoh_bridge", options) {
   started_epoch_ms_ = nowEpochMs();
   last_stats_ns_ = nowSteadyNs();
@@ -158,34 +207,54 @@ ZenohBridgeNode::ZenohBridgeNode(const rclcpp::NodeOptions &options)
   const std::string default_distro =
       (env_distro != nullptr && *env_distro != '\0') ? std::string(env_distro) : std::string("ros2");
 
-  runtime_config_file_ = this->declare_parameter<std::string>("runtime_config_file", "");
-  agent_id_ = trimSlashes(this->declare_parameter<std::string>("agent_id", "uav1"));
-  default_agent_id_ = agent_id_;
+  this->declare_parameter<std::string>("runtime_config_file", startup.runtime_path);
+  RuntimeConfig initial;
+  initial.agent_id = trimSlashes(this->declare_parameter<std::string>("agent_id", "uav1"));
+  default_agent_id_ = initial.agent_id;
   robot_type_ = this->declare_parameter<std::string>("robot_type", "rotor");
-  domain_prefix_ = trimSlashes(this->declare_parameter<std::string>("domain_prefix", kDefaultDomainPrefix));
+  initial.bridge.domain_prefix = trimSlashes(this->declare_parameter<std::string>("domain_prefix", kDefaultDomainPrefix));
   ros_distro_ = this->declare_parameter<std::string>("ros_distro", default_distro);
   rules_file_ = this->declare_parameter<std::string>("rules_file", "");
   session_override_file_ = this->declare_parameter<std::string>("session_override_file", "");
-  bridge_settings_file_ = this->declare_parameter<std::string>("bridge_settings_file", "");
-  default_preset_ = this->declare_parameter<std::string>("default_preset", "empty");
+  this->declare_parameter<std::string>("bridge_settings_file", startup.settings_path);
+  bridge_settings_file_ = startup.settings_path;
+  dds_shield_script_ = startup.shield_script;
+  ros_domain_id_ = startup.domain_id;
+  dds_shield_error_ = startup.shield_error;
+  if (!startup.shield_status.is_null()) {
+    dds_shield_active_ = startup.shield_status.at("active").get<bool>();
+    dds_shield_rx_dropped_ = startup.shield_status.value("rx_dropped_packets", uint64_t{0});
+    dds_shield_tx_dropped_ = startup.shield_status.value("tx_dropped_packets", uint64_t{0});
+    last_shield_poll_ns_ = nowSteadyNs();
+  }
+  initial.bridge.default_preset = this->declare_parameter<std::string>("default_preset", "empty");
   api_bind_host_ = this->declare_parameter<std::string>("api_bind_host", "127.0.0.1");
   api_port_ = this->declare_parameter<int>("api_port", 17447);
-  allow_unprefixed_local_ = this->declare_parameter<bool>("allow_unprefixed_local", true);
-  liveliness_enabled_ = this->declare_parameter<bool>("liveliness_enabled", true);
+  initial.bridge.allow_unprefixed_local = this->declare_parameter<bool>("allow_unprefixed_local", true);
+  initial.bridge.liveliness_enabled = this->declare_parameter<bool>("liveliness_enabled", true);
 
-  loadRuntimeConfigFile();
+  loadStartupConfig(initial, startup);
 
   if (default_agent_id_.empty()) default_agent_id_ = hostname_;
-  if (agent_id_.empty()) agent_id_ = default_agent_id_;
-  if (domain_prefix_.empty()) domain_prefix_ = kDefaultDomainPrefix;
+  if (initial.agent_id.empty()) initial.agent_id = default_agent_id_;
+  if (initial.bridge.domain_prefix.empty()) initial.bridge.domain_prefix = kDefaultDomainPrefix;
 
-  initZenohSession();
-  loadInitialRules();
+  {
+    std::lock_guard<std::mutex> writer(reconfigure_mutex_);
+    publishConfig(initial);
+    initZenohSession(std::move(initial));
+    loadInitialRules();
+  }
 
   discovery_timer_ = this->create_wall_timer(
       std::chrono::milliseconds(500), [this]() { onDiscoveryTimer(); });
   status_timer_ = this->create_wall_timer(
       std::chrono::milliseconds(1000), [this]() { onStatusTimer(); });
+  // The default group also runs the ROS subscriptions. Never wait for a
+  // privileged helper there, even when the bridge is configured to filter DDS.
+  shield_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  shield_timer_ = create_wall_timer(std::chrono::seconds(1), [this]() { pollDdsShieldStatus(); },
+                                    shield_callback_group_);
 
   if (api_port_ > 0) {
     if (http_server_.start(api_bind_host_, api_port_,
@@ -198,100 +267,49 @@ ZenohBridgeNode::ZenohBridgeNode(const rclcpp::NodeOptions &options)
     }
   }
 
+  const auto config = configSnapshot();
+  if (!startup.shield_error.empty()) {
+    RCLCPP_WARN(this->get_logger(), "DDS Shield: %s", startup.shield_error.c_str());
+  }
+
   RCLCPP_INFO(this->get_logger(),
-              "Zenoh Bridge v2.1 started: agent_id=%s, prefix=%s, mode=%s, cfg_mode=%s, rules=%s",
-              agent_id_.c_str(), domain_prefix_.c_str(), session_cfg_.mode.c_str(),
-              session_cfg_.config_mode.c_str(),
+              "Zenoh Bridge v2.2 started: agent_id=%s, prefix=%s, mode=%s, cfg_mode=%s, rules=%s",
+              config->agent_id.c_str(), config->bridge.domain_prefix.c_str(), config->session.mode.c_str(),
+              config->session.config_mode.c_str(),
               rules_file_.empty() ? "(memory)" : rules_file_.c_str());
-  addLog("INFO", "Zenoh Bridge v2.1 started: agent_id=" + agent_id_ + ", prefix=" + domain_prefix_ +
-                     ", mode=" + session_cfg_.mode + ", ros=" + ros_distro_);
+  addLog("INFO", "Zenoh Bridge v2.2 started: agent_id=" + config->agent_id + ", prefix=" + config->bridge.domain_prefix +
+                     ", mode=" + config->session.mode + ", ros=" + ros_distro_);
 }
 
 ZenohBridgeNode::~ZenohBridgeNode() {
-  shutting_down_.store(true, std::memory_order_release);
   http_server_.stop();
   if (discovery_timer_) discovery_timer_->cancel();
   if (status_timer_) status_timer_->cancel();
+  if (shield_timer_) shield_timer_->cancel();
   teardownZenohSession();
+  // Owner protection outlives the process. Only an authorized explicit
+  // disable may remove it, never shutdown, a failed restart, or another owner.
 }
 
-void ZenohBridgeNode::loadRuntimeConfigFile() {
-  if (!runtime_config_file_.empty() && std::filesystem::exists(runtime_config_file_)) {
-    try {
-      std::ifstream ifs(runtime_config_file_);
-      nlohmann::json j;
-      ifs >> j;
-      if (j.contains("default_agent_id") && j["default_agent_id"].is_string() &&
-          !j["default_agent_id"].get<std::string>().empty()) {
-        default_agent_id_ = trimSlashes(j["default_agent_id"].get<std::string>());
-      }
-      if (j.contains("agent_id") && j["agent_id"].is_string() && !j["agent_id"].get<std::string>().empty()) {
-        agent_id_ = trimSlashes(j["agent_id"].get<std::string>());
-      }
-      if (j.contains("robot_type") && j["robot_type"].is_string()) {
-        robot_type_ = j["robot_type"].get<std::string>();
-      }
-      if (j.contains("domain_prefix") && j["domain_prefix"].is_string() &&
-          !j["domain_prefix"].get<std::string>().empty()) {
-        domain_prefix_ = trimSlashes(j["domain_prefix"].get<std::string>());
-      }
-      if (j.contains("rules_file") && j["rules_file"].is_string()) {
-        rules_file_ = j["rules_file"].get<std::string>();
-      }
-      if (j.contains("session_override_file") && j["session_override_file"].is_string()) {
-        session_override_file_ = j["session_override_file"].get<std::string>();
-      }
-      if (j.contains("bridge_settings_file") && j["bridge_settings_file"].is_string()) {
-        bridge_settings_file_ = j["bridge_settings_file"].get<std::string>();
-      }
-      if (j.contains("default_preset") && j["default_preset"].is_string()) {
-        default_preset_ = j["default_preset"].get<std::string>();
-      }
-      if (j.contains("api_bind_host") && j["api_bind_host"].is_string()) {
-        api_bind_host_ = j["api_bind_host"].get<std::string>();
-      }
-      if (j.contains("api_port") && j["api_port"].is_number_integer()) {
-        api_port_ = j["api_port"].get<int>();
-      }
-      if (j.contains("allow_unprefixed_local") && j["allow_unprefixed_local"].is_boolean()) {
-        allow_unprefixed_local_ = j["allow_unprefixed_local"].get<bool>();
-      }
-      if (j.contains("liveliness_enabled") && j["liveliness_enabled"].is_boolean()) {
-        liveliness_enabled_ = j["liveliness_enabled"].get<bool>();
-      }
-      if (j.contains("session") && j["session"].is_object()) {
-        session_cfg_ = j["session"].get<SessionConfig>();
-      }
-    } catch (const std::exception &e) {
-      RCLCPP_WARN(this->get_logger(), "Failed to parse runtime_config_file '%s': %s",
-                  runtime_config_file_.c_str(), e.what());
-    }
-  }
+void ZenohBridgeNode::loadStartupConfig(RuntimeConfig &config, const StartupConfig &startup) {
+  const auto &j = startup.runtime;
+  const auto default_agent = trimSlashes(j.value("default_agent_id", default_agent_id_));
+  if (!default_agent.empty()) default_agent_id_ = default_agent;
+  robot_type_ = j.value("robot_type", robot_type_);
+  rules_file_ = j.value("rules_file", rules_file_);
+  session_override_file_ = j.value("session_override_file", session_override_file_);
+  api_bind_host_ = j.value("api_bind_host", api_bind_host_);
+  api_port_ = j.value("api_port", api_port_);
+  if (j.contains("session")) config.session = j.at("session").get<SessionConfig>();
 
-  // Initialize bridge_settings_ from runtime defaults, then overlay persisted bridge_settings.json
-  bridge_settings_.agent_id = (agent_id_ == default_agent_id_) ? "" : agent_id_;
-  bridge_settings_.domain_prefix = domain_prefix_;
-  bridge_settings_.default_preset = default_preset_;
-  bridge_settings_.allow_unprefixed_local = allow_unprefixed_local_;
-  bridge_settings_.liveliness_enabled = liveliness_enabled_;
-
-  if (!bridge_settings_file_.empty() && std::filesystem::exists(bridge_settings_file_)) {
-    try {
-      std::ifstream ifs(bridge_settings_file_);
-      nlohmann::json j;
-      ifs >> j;
-      bridge_settings_ = j.get<BridgeSettings>();
-      agent_id_ = bridge_settings_.agent_id.empty() ? default_agent_id_ : bridge_settings_.agent_id;
-      domain_prefix_ = bridge_settings_.domain_prefix.empty() ? kDefaultDomainPrefix : bridge_settings_.domain_prefix;
-      default_preset_ = bridge_settings_.default_preset;
-      allow_unprefixed_local_ = bridge_settings_.allow_unprefixed_local;
-      liveliness_enabled_ = bridge_settings_.liveliness_enabled;
-      RCLCPP_INFO(this->get_logger(), "Loaded UI bridge settings from %s", bridge_settings_file_.c_str());
-    } catch (const std::exception &e) {
-      RCLCPP_WARN(this->get_logger(), "Failed to load bridge_settings_file '%s': %s",
-                  bridge_settings_file_.c_str(), e.what());
-    }
-  }
+  config.bridge.agent_id = config.agent_id;
+  config.bridge = mergedBridgeSettings(config.bridge, j);
+  if (config.bridge.agent_id == default_agent_id_) config.bridge.agent_id.clear();
+  config.bridge = mergedBridgeSettings(config.bridge, startup.persisted);
+  config.agent_id = config.bridge.agent_id.empty() ? default_agent_id_ : config.bridge.agent_id;
+  config.bridge.dds_shield_enabled = startup.shield_policy.dds_shield_enabled;
+  config.bridge.dds_shield_scope = startup.shield_policy.dds_shield_scope;
+  config.bridge.dds_shield_domains = startup.shield_policy.dds_shield_domains;
 
   // Apply persisted UI session overrides if present
   if (!session_override_file_.empty() && std::filesystem::exists(session_override_file_)) {
@@ -299,7 +317,7 @@ void ZenohBridgeNode::loadRuntimeConfigFile() {
       std::ifstream ifs(session_override_file_);
       nlohmann::json j;
       ifs >> j;
-      session_cfg_ = j.get<SessionConfig>();
+      config.session = j.get<SessionConfig>();
       RCLCPP_INFO(this->get_logger(), "Loaded UI session override from %s",
                   session_override_file_.c_str());
     } catch (const std::exception &e) {
@@ -565,50 +583,52 @@ zenoh::Config ZenohBridgeNode::buildZenohConfig(const SessionConfig &sc,
   return cfg;
 }
 
-void ZenohBridgeNode::initZenohSession() {
-  std::lock_guard<std::mutex> lk(session_mutex_);
+void ZenohBridgeNode::publishConfig(RuntimeConfig next) {
+  auto published = std::make_shared<const RuntimeConfig>(std::move(next));
+  {
+    std::lock_guard<std::mutex> lock(config_mutex_);
+    config_.swap(published);
+  }
+}
 
+void ZenohBridgeNode::initZenohSession(RuntimeConfig next) {
   std::string effective_json;
-  zenoh::Config cfg = buildZenohConfig(session_cfg_, effective_json);
-  effective_zenoh_config_json_ = effective_json;
+  zenoh::Config cfg = buildZenohConfig(next.session, effective_json);
 
   // Sync effective mode back for display if raw_json5 changed it
   try {
-    const auto parsed = nlohmann::json::parse(effective_json);
+    next.effective = nlohmann::json::parse(effective_json);
+    const auto &parsed = next.effective;
     if (parsed.contains("mode") && parsed["mode"].is_string()) {
-      session_cfg_.mode = parsed["mode"].get<std::string>();
+      next.session.mode = parsed["mode"].get<std::string>();
     }
-  } catch (...) {
+  } catch (const nlohmann::json::parse_error &) {
+    next.effective = effective_json;
   }
 
-  session_.emplace(zenoh::Session::open(std::move(cfg)));
+  auto session = std::make_shared<zenoh::Session>(std::move(cfg));
 
   auto status_opts = zenoh::Session::PublisherOptions::create_default();
   status_opts.priority = Z_PRIORITY_DATA_LOW;
   status_opts.congestion_control = Z_CONGESTION_CONTROL_DROP;
-  status_pub_.emplace(session_->declare_publisher(
-      zenoh::KeyExpr(makeStatusKey(domain_prefix_, agent_id_)), std::move(status_opts)));
+  auto status_pub = session->declare_publisher(
+      zenoh::KeyExpr(makeStatusKey(next.bridge.domain_prefix, next.agent_id)), std::move(status_opts));
 
-  ctrl_queryable_.emplace(session_->declare_queryable(
-      zenoh::KeyExpr(makeControlKey(domain_prefix_, agent_id_)),
-      [this](const zenoh::Query &query) { handleControlQuery(query); },
-      zenoh::closures::none));
-
-  swarm_status_sub_.emplace(session_->declare_subscriber(
-      zenoh::KeyExpr(makeStatusWildcard(domain_prefix_)),
+  swarm_status_sub_.emplace(session->declare_subscriber(
+      zenoh::KeyExpr(makeStatusWildcard(next.bridge.domain_prefix)),
       [this](const zenoh::Sample &sample) { handlePeerStatusSample(sample); },
       zenoh::closures::none));
 
   // Official Zenoh Liveliness Token & Subscriber
-  if (liveliness_enabled_) {
+  if (next.bridge.liveliness_enabled) {
     try {
-      const std::string live_key = makeLivelinessKey(domain_prefix_, agent_id_);
-      own_liveliness_token_.emplace(session_->liveliness_declare_token(zenoh::KeyExpr(live_key)));
+      const std::string live_key = makeLivelinessKey(next.bridge.domain_prefix, next.agent_id);
+      own_liveliness_token_.emplace(session->liveliness_declare_token(zenoh::KeyExpr(live_key)));
 
       auto live_sub_opts = zenoh::Session::LivelinessSubscriberOptions::create_default();
       live_sub_opts.history = true;
-      liveliness_sub_.emplace(session_->liveliness_declare_subscriber(
-          zenoh::KeyExpr(makeLivelinessWildcard(domain_prefix_)),
+      liveliness_sub_.emplace(session->liveliness_declare_subscriber(
+          zenoh::KeyExpr(makeLivelinessWildcard(next.bridge.domain_prefix)),
           [this](const zenoh::Sample &sample) {
             const std::string key(sample.get_keyexpr().as_string_view());
             const bool alive = (sample.get_kind() == Z_SAMPLE_KIND_PUT);
@@ -633,7 +653,7 @@ void ZenohBridgeNode::initZenohSession() {
   try {
     auto t_opts = zenoh::Session::TransportEventsListenerOptions::create_default();
     t_opts.history = false;
-    transport_events_listener_.emplace(session_->declare_transport_events_listener(
+    transport_events_listener_.emplace(session->declare_transport_events_listener(
         [this](const zenoh::TransportEvent &ev) {
           const bool opened = (ev.get_kind() == Z_SAMPLE_KIND_PUT);
           const auto &tr = ev.get_transport();
@@ -646,7 +666,7 @@ void ZenohBridgeNode::initZenohSession() {
 
     auto l_opts = zenoh::Session::LinkEventsListenerOptions::create_default();
     l_opts.history = false;
-    link_events_listener_.emplace(session_->declare_link_events_listener(
+    link_events_listener_.emplace(session->declare_link_events_listener(
         [this](const zenoh::LinkEvent &ev) {
           const bool added = (ev.get_kind() == Z_SAMPLE_KIND_PUT);
           const auto &lnk = ev.get_link();
@@ -659,14 +679,39 @@ void ZenohBridgeNode::initZenohSession() {
     RCLCPP_WARN(get_logger(), "Connectivity event listeners skipped: %s", e.what());
   }
 #endif
+
+  ctrl_queryable_.emplace(session->declare_queryable(
+      zenoh::KeyExpr(makeControlKey(next.bridge.domain_prefix, next.agent_id)),
+      [this](const zenoh::Query &query) { handleControlQuery(query); },
+      zenoh::closures::none));
+
+  next.active_session = std::move(session);
+  std::lock_guard<std::mutex> lk(session_mutex_);
+  status_pub_.emplace(std::move(status_pub));
+  publishConfig(std::move(next));
 }
 
 void ZenohBridgeNode::teardownZenohSession() {
+  // Stop admitting operations before draining any callbacks. In particular,
+  // dropping the control queryable can wait for a callback in applyRules().
+  auto disconnected = *configSnapshot();
+  auto old_session = std::move(disconnected.active_session);
+  decltype(status_pub_) old_status;
+  {
+    std::lock_guard<std::mutex> lk(session_mutex_);
+    old_status = std::exchange(status_pub_, std::nullopt);
+    publishConfig(std::move(disconnected));
+  }
+  ctrl_queryable_.reset();
+  old_status.reset();
+
+  decltype(sniff_sub_) old_sniff;
   {
     std::lock_guard<std::mutex> slk(sniff_mutex_);
     sniff_active_.store(false, std::memory_order_release);
-    sniff_sub_.reset();
+    old_sniff = std::exchange(sniff_sub_, std::nullopt);
   }
+  old_sniff.reset();
   std::map<std::string, zenoh::LivelinessToken> old_tokens;
   {
     std::lock_guard<std::mutex> llk(liveliness_mutex_);
@@ -688,7 +733,6 @@ void ZenohBridgeNode::teardownZenohSession() {
   old_egress.clear();
   old_ingress.clear();
 
-  std::lock_guard<std::mutex> lk(session_mutex_);
 #if defined(Z_FEATURE_UNSTABLE_API)
   link_events_listener_.reset();
   transport_events_listener_.reset();
@@ -696,16 +740,26 @@ void ZenohBridgeNode::teardownZenohSession() {
   liveliness_sub_.reset();
   own_liveliness_token_.reset();
   swarm_status_sub_.reset();
-  ctrl_queryable_.reset();
-  status_pub_.reset();
-  session_.reset();
+  // Snapshots/queries may still own the C++ handle. Close the old connection
+  // now so its listeners/endpoints are released before opening a replacement.
+  if (old_session) {
+    zenoh::ZResult result;
+    old_session->close(zenoh::Session::SessionCloseOptions::create_default(), &result);
+  }
 }
 
 bool ZenohBridgeNode::reconnectSession(const SessionConfig &new_cfg, bool persist, std::string &out_msg) {
+  std::lock_guard<std::mutex> writer(reconfigure_mutex_);
+  auto next = *configSnapshot();
+  next.session = new_cfg;
+  return reconnectSessionLocked(std::move(next), persist, out_msg);
+}
+
+bool ZenohBridgeNode::reconnectSessionLocked(RuntimeConfig next, bool persist, std::string &out_msg) {
   // Dry-run validate BEFORE tearing down active session!
   try {
     std::string preview;
-    auto test_cfg = buildZenohConfig(new_cfg, preview);
+    auto test_cfg = buildZenohConfig(next.session, preview);
     (void)test_cfg;
   } catch (const std::exception &e) {
     out_msg = std::string("Invalid Zenoh configuration: ") + e.what();
@@ -713,111 +767,183 @@ bool ZenohBridgeNode::reconnectSession(const SessionConfig &new_cfg, bool persis
     return false;
   }
 
-  RuleSet saved_rules = getCurrentRules();
-  SessionConfig backup_cfg = session_cfg_;
+  const RuleSet saved_rules = getCurrentRules();
+  const auto backup = configSnapshot();
 
+  auto openWithSavedRules = [&](RuntimeConfig config) {
+    initZenohSession(std::move(config));
+    std::string message;
+    if (!applyRules(saved_rules, false, message)) throw std::runtime_error(message);
+  };
   teardownZenohSession();
-  session_cfg_ = new_cfg;
   try {
-    initZenohSession();
+    openWithSavedRules(std::move(next));
   } catch (const std::exception &e) {
-    out_msg = std::string("Failed to open Zenoh session with new config: ") + e.what();
+    out_msg = std::string("Failed to reconfigure Zenoh session: ") + e.what();
     RCLCPP_ERROR(get_logger(), "%s — reverting to previous config", out_msg.c_str());
     addLog("ERROR", out_msg);
-    session_cfg_ = backup_cfg;
+    teardownZenohSession();
     try {
-      initZenohSession();
-      std::string dummy;
-      applyRules(saved_rules, false, dummy);
-    } catch (...) {
+      openWithSavedRules(*backup);
+    } catch (const std::exception &rollback_error) {
+      teardownZenohSession();
+      out_msg += std::string("; failed to restore previous session: ") + rollback_error.what();
     }
     return false;
   }
 
-  std::string apply_msg;
-  applyRules(saved_rules, false, apply_msg);
-
+  const auto config = configSnapshot();
   if (persist && !session_override_file_.empty()) {
     try {
-      atomicWriteFile(session_override_file_, nlohmann::json(session_cfg_).dump(2) + "\n");
+      atomicWriteFile(session_override_file_, nlohmann::json(config->session).dump(2) + "\n");
     } catch (const std::exception &e) {
       out_msg = std::string("Session reconnected, but failed to persist override: ") + e.what();
       return true;
     }
   }
 
-  out_msg = "Zenoh session reconnected (mode=" + session_cfg_.mode +
-            ", config_mode=" + session_cfg_.config_mode + ")";
+  out_msg = "Zenoh session reconnected (mode=" + config->session.mode +
+            ", config_mode=" + config->session.config_mode + ")";
   addLog("INFO", out_msg);
   return true;
 }
 
-bool ZenohBridgeNode::updateBridgeSettings(const BridgeSettings &new_settings,
-                                           bool persist,
-                                           std::string &out_msg) {
-  BridgeSettings clean = new_settings;
+int ZenohBridgeNode::updateBridgeSettings(const nlohmann::json &patch, bool persist,
+                                           bool shield_admin, std::string &out_msg,
+                                           bool reconcile_shield, const nlohmann::json &expected_policy) {
+  std::lock_guard<std::mutex> writer(reconfigure_mutex_);
+  const auto current = configSnapshot();
+  if (!expected_policy.is_null() && expected_policy != nlohmann::json{
+          {"enabled", current->bridge.dds_shield_enabled}, {"scope", current->bridge.dds_shield_scope},
+          {"domains", current->bridge.dds_shield_domains}}) {
+    out_msg = "DDS Shield policy changed; review current settings before applying";
+    return 409;
+  }
+  BridgeSettings clean;
+  try {
+    clean = mergedBridgeSettings(current->bridge, patch);
+  } catch (const std::exception &e) {
+    out_msg = e.what();
+    return 400;
+  }
   clean.agent_id = trimSlashes(trimWhitespace(clean.agent_id));
   clean.domain_prefix = trimSlashes(trimWhitespace(clean.domain_prefix));
   if (clean.domain_prefix.empty()) clean.domain_prefix = kDefaultDomainPrefix;
   if (clean.default_preset.empty()) clean.default_preset = "empty";
+  const auto &agent_id = clean.agent_id.empty() ? default_agent_id_ : clean.agent_id;
 
-  const std::string next_agent_id = clean.agent_id.empty() ? default_agent_id_ : clean.agent_id;
-  const bool need_reconnect = (next_agent_id != agent_id_) ||
-                              (clean.domain_prefix != domain_prefix_) ||
-                              (clean.liveliness_enabled != liveliness_enabled_);
-
-  const std::string old_agent_id = agent_id_;
-  bridge_settings_ = clean;
-  agent_id_ = next_agent_id;
-  domain_prefix_ = clean.domain_prefix;
-  default_preset_ = clean.default_preset;
-  allow_unprefixed_local_ = clean.allow_unprefixed_local;
-  liveliness_enabled_ = clean.liveliness_enabled;
-
-  if (old_agent_id != agent_id_) {
-    std::lock_guard<std::mutex> plk(peers_mutex_);
-    remote_agents_.erase(old_agent_id);
-    remote_last_seen_ms_.erase(old_agent_id);
+  const bool shield_changed = shieldPolicyChanged(clean, current->bridge);
+  if ((reconcile_shield || shield_changed) && !shield_admin) {
+    out_msg = kShieldWriteDenied;
+    return 403;
   }
-
-  if (persist && !bridge_settings_file_.empty()) {
+  const bool need_reconnect = agent_id != current->agent_id ||
+                              clean.domain_prefix != current->bridge.domain_prefix ||
+                              clean.liveliness_enabled != current->bridge.liveliness_enabled;
+  std::string saved_json;
+  if (persist) {
     try {
-      atomicWriteFile(bridge_settings_file_, nlohmann::json(bridge_settings_).dump(2) + "\n");
+      if (bridge_settings_file_.empty()) throw std::runtime_error("No bridge_settings_file configured");
+      nlohmann::json saved = clean;
+      if (!shield_admin || !hasShieldFields(patch)) {
+        // Saving an unrelated setting must not make a *transient* firewall
+        // change durable, including when the request came from Zenoh.
+        const auto disk = readConfigObject(bridge_settings_file_, true);
+        const nlohmann::json normalized = disk.get<BridgeSettings>();
+        for (const char *key : kShieldFields) {
+          if (disk.contains(key)) saved[key] = normalized.at(key);
+          else saved.erase(key);
+        }
+      }
+      saved_json = saved.dump(2) + "\n";
     } catch (const std::exception &e) {
-      out_msg = std::string("Failed to persist bridge_settings.json: ") + e.what();
-      return false;
+      out_msg = std::string("Cannot save bridge settings: ") + e.what();
+      return 500;
     }
   }
 
-  if (need_reconnect) {
-    std::string rc_msg;
-    if (!reconnectSession(session_cfg_, false, rc_msg)) {
-      out_msg = "Settings saved, but reconnect failed: " + rc_msg;
-      return false;
-    }
-  } else {
-    attachEgressRosSubscriptions();
+  const auto applyShield = [&](const BridgeSettings &policy, std::string &msg) {
+    return runDdsShieldAction(policy.dds_shield_enabled ? "enable" : "disable", msg,
+                              policy.dds_shield_scope, policy.dds_shield_domains);
+  };
+  // Staging new parameters while disabled must leave a retained filter alone.
+  // Only an authorized, explicit enabled:false means remove the owner's table.
+  const bool apply_shield = clean.dds_shield_enabled ? (reconcile_shield || shield_changed)
+      : shield_admin && patch.contains("dds_shield_enabled");
+  BridgeSettings installed;
+  if (apply_shield) {
+    // Snapshot the verified kernel policy under the writer lock. Desired settings
+    // and cached telemetry can both be stale after a restart or external change.
+    if (!runDdsShieldAction("snapshot", out_msg, current->bridge.dds_shield_scope,
+                            current->bridge.dds_shield_domains, &installed)) return 503;
+    if (!applyShield(clean, out_msg)) return 503;
   }
 
-  out_msg = "Bridge settings updated (agent_id=" + agent_id_ +
-            ", prefix=" + domain_prefix_ + ", liveliness=" +
-            (liveliness_enabled_ ? "on" : "off") + ")";
+  bool changed_runtime = false;
+  auto applyRuntime = [&](RuntimeConfig config) {
+    if (need_reconnect) {
+      std::string msg;
+      if (!reconnectSessionLocked(std::move(config), false, msg)) throw std::runtime_error(msg);
+    } else {
+      publishConfig(std::move(config));
+    }
+    changed_runtime = true;  // The new generation is visible even if reattachment fails.
+    if (!need_reconnect && clean.allow_unprefixed_local != current->bridge.allow_unprefixed_local)
+      attachEgressRosSubscriptions();
+  };
+  try {
+    auto next = *current;
+    next.bridge = clean;
+    next.agent_id = agent_id;
+    applyRuntime(std::move(next));
+    if (persist) atomicWriteFile(bridge_settings_file_, saved_json);
+  } catch (const std::exception &e) {
+    out_msg = e.what();
+    if (changed_runtime) {
+      try {
+        applyRuntime(*current);
+      } catch (const std::exception &restore_error) {
+        out_msg += std::string("; bridge rollback failed: ") + restore_error.what();
+      }
+    }
+    if (apply_shield) {
+      std::string msg;
+      if (!applyShield(installed, msg)) {
+        out_msg += "; DDS Shield rollback failed: " + msg;
+      } else if (installed.dds_shield_enabled != current->bridge.dds_shield_enabled ||
+                 (installed.dds_shield_enabled && (installed.dds_shield_scope != current->bridge.dds_shield_scope ||
+                  installed.dds_shield_domains != resolveShieldDomains(current->bridge.dds_shield_domains)))) {
+        std::lock_guard<std::mutex> lk(dds_shield_mutex_);
+        dds_shield_error_ = "Restored DDS Shield policy differs from configured policy";
+      }
+    }
+    addLog("ERROR", out_msg);
+    return 500;
+  }
+
+  if (current->agent_id != agent_id) {
+    std::lock_guard<std::mutex> plk(peers_mutex_);
+    remote_agents_.erase(current->agent_id);
+    remote_last_seen_ms_.erase(current->agent_id);
+  }
+  out_msg = "Bridge settings updated (agent_id=" + agent_id + ", prefix=" + clean.domain_prefix + ")";
   addLog("INFO", out_msg);
-  return true;
+  return 200;
 }
 
 void ZenohBridgeNode::loadInitialRules() {
+  const auto config = configSnapshot();
   RuleSet rules;
   if (!rules_file_.empty() && std::filesystem::exists(rules_file_)) {
     try {
       rules = loadRulesFromYamlFile(rules_file_);
     } catch (const std::exception &e) {
       RCLCPP_WARN(get_logger(), "Failed to load rules_file '%s': %s. Using preset '%s'.",
-                  rules_file_.c_str(), e.what(), default_preset_.c_str());
-      rules = makePresetRules(default_preset_);
+                  rules_file_.c_str(), e.what(), config->bridge.default_preset.c_str());
+      rules = makePresetRules(config->bridge.default_preset);
     }
   } else {
-    rules = makePresetRules(default_preset_);
+    rules = makePresetRules(config->bridge.default_preset);
   }
   std::string msg;
   applyRules(rules, false, msg);
@@ -825,6 +951,10 @@ void ZenohBridgeNode::loadInitialRules() {
 
 RuleSet ZenohBridgeNode::getCurrentRules() const {
   std::lock_guard<std::mutex> lk(state_mutex_);
+  return snapshotRulesLocked();
+}
+
+RuleSet ZenohBridgeNode::snapshotRulesLocked() const {
   RuleSet rs;
   rs.egress.reserve(egress_list_.size());
   for (const auto &e : egress_list_) {
@@ -868,7 +998,9 @@ bool ZenohBridgeNode::applyRules(const RuleSet &new_rules, bool persist_to_file,
 
   {
     std::lock_guard<std::mutex> slk(session_mutex_);
-    if (!session_.has_value()) {
+    const auto config = configSnapshot();
+    const auto &session = config->active_session;
+    if (!session) {
       out_msg = "Zenoh session is not initialized";
       return false;
     }
@@ -876,7 +1008,7 @@ bool ZenohBridgeNode::applyRules(const RuleSet &new_rules, bool persist_to_file,
     try {
       std::set<std::string> seen_egress;
       for (const auto &raw_rule : new_rules.egress) {
-        const std::string rel = normalizeRelativeTopic(raw_rule.topic, agent_id_);
+        const std::string rel = normalizeRelativeTopic(raw_rule.topic, config->agent_id);
         if (rel.empty() || !seen_egress.insert(rel).second) {
           continue;
         }
@@ -887,7 +1019,8 @@ bool ZenohBridgeNode::applyRules(const RuleSet &new_rules, bool persist_to_file,
         eg->rule.locality = normalizeLocalityName(raw_rule.locality);
         eg->rule.history_depth = std::max(1, std::min(1000, raw_rule.history_depth));
         eg->rel_topic = rel;
-        eg->zenoh_key = makeDataKey(domain_prefix_, agent_id_, rel, raw_rule.zenoh_key);
+        eg->agent_id = config->agent_id;
+        eg->zenoh_key = makeDataKey(config->bridge.domain_prefix, eg->agent_id, rel, raw_rule.zenoh_key);
 
         if (eg->rule.enabled) {
           auto pub_opts = zenoh::Session::PublisherOptions::create_default();
@@ -900,7 +1033,7 @@ bool ZenohBridgeNode::applyRules(const RuleSet &new_rules, bool persist_to_file,
                                      ? Z_RELIABILITY_BEST_EFFORT
                                      : Z_RELIABILITY_RELIABLE;
 #endif
-          eg->z_pub.emplace(session_->declare_publisher(
+          eg->z_pub.emplace(session->declare_publisher(
               zenoh::KeyExpr(eg->zenoh_key), std::move(pub_opts)));
 
           try {
@@ -930,7 +1063,7 @@ bool ZenohBridgeNode::applyRules(const RuleSet &new_rules, bool persist_to_file,
         rule.pattern = norm_pat;
         rule.locality = normalizeLocalityName(raw_rule.locality);
         rule.history_depth = std::max(1, std::min(1000, raw_rule.history_depth));
-        next_ingress.push_back(makeIngress(rule, false));
+        next_ingress.push_back(makeIngress(rule, *config));
       }
     } catch (const std::exception &e) {
       out_msg = std::string("Failed to apply Zenoh rules: ") + e.what();
@@ -982,22 +1115,26 @@ bool ZenohBridgeNode::applyRules(const RuleSet &new_rules, bool persist_to_file,
   out_msg = "Applied " + std::to_string(applied_egress) + " egress and " +
             std::to_string(applied_ingress) + " ingress rules" +
             (saved ? " (saved)" : "");
-  RCLCPP_INFO(get_logger(), "[%s] %s", agent_id_.c_str(), out_msg.c_str());
+  RCLCPP_INFO(get_logger(), "[%s] %s", configSnapshot()->agent_id.c_str(), out_msg.c_str());
   addLog("INFO", out_msg);
   return true;
 }
 
 std::shared_ptr<ZenohBridgeNode::ActiveIngress> ZenohBridgeNode::makeIngress(
-    const IngressRule &rule, bool initially_active) {
+    const IngressRule &rule, const RuntimeConfig &config) {
   auto ig = std::make_shared<ActiveIngress>();
-  ig->active.store(initially_active, std::memory_order_relaxed);
+  ig->active.store(false, std::memory_order_relaxed);
   ig->rule = rule;
-  ig->zenoh_pattern = makeDataSubKey(domain_prefix_, rule.pattern);
+  ig->agent_id = config.agent_id;
+  ig->domain_prefix = config.bridge.domain_prefix;
+  // A submitted rule may be a snapshot; only the new endpoint map is live.
+  ig->rule.active_endpoints.clear();
+  ig->zenoh_pattern = makeDataSubKey(config.bridge.domain_prefix, rule.pattern);
   if (rule.enabled) {
     auto sub_opts = zenoh::Session::SubscriberOptions::create_default();
     sub_opts.allowed_origin = parseLocality(rule.locality);
     std::weak_ptr<ActiveIngress> weak_ig = ig;
-    ig->z_sub.emplace(session_->declare_subscriber(
+    ig->z_sub.emplace(config.active_session->declare_subscriber(
         zenoh::KeyExpr(ig->zenoh_pattern),
         [this, weak_ig](const zenoh::Sample &sample) {
           if (auto locked = weak_ig.lock()) {
@@ -1021,6 +1158,7 @@ std::string ZenohBridgeNode::localIngressTopic(const IngressRule &rule,
 
 void ZenohBridgeNode::attachEgressRosSubscriptions() {
   std::lock_guard<std::mutex> discovery_lock(discovery_mutex_);
+  const bool allow_unprefixed = configSnapshot()->bridge.allow_unprefixed_local;
   std::set<std::string> owned_ingress;
   std::vector<std::shared_ptr<ActiveEgress>> egress;
   {
@@ -1033,24 +1171,29 @@ void ZenohBridgeNode::attachEgressRosSubscriptions() {
   std::vector<LocalTopicInfo> discovered;
   for (const auto &entry : get_topic_names_and_types()) {
     if (isInternalSystemTopic(entry.first) || owned_ingress.count(entry.first)) continue;
-    auto infos = get_publishers_info_by_topic(entry.first);
-    auto sub_infos = get_subscriptions_info_by_topic(entry.first);
-    if (infos.empty()) continue;
-
-    std::map<std::string, std::vector<rclcpp::TopicEndpointInfo>> by_type;
+    std::vector<rclcpp::TopicEndpointInfo> infos;
+    int sub_count = 0;
+    try {
+      infos = get_publishers_info_by_topic(entry.first);
+      if (infos.empty()) continue;
+      sub_count = static_cast<int>(count_subscribers(entry.first));
+    } catch (const std::exception &) {
+      // Skip internal DDS/transport topics with non-ROS2-valid names (e.g. /camera/image_raw/_buf/<hex>)
+      continue;
+    }
+    std::map<std::string, LocalTopicInfo> by_type;
     for (const auto &info : infos) {
-      by_type[info.topic_type()].push_back(info);
+      auto &topic = by_type[info.topic_type()];
+      if (topic.pub_count == 0) {
+        topic.name = entry.first;
+        topic.type = info.topic_type();
+        topic.sub_count = sub_count;
+        topic.reliability = reliabilityToStr(info.qos_profile().reliability());
+        topic.durability = durabilityToStr(info.qos_profile().durability());
+      }
+      ++topic.pub_count;
     }
-    for (const auto &kv : by_type) {
-      LocalTopicInfo lt;
-      lt.name = entry.first;
-      lt.type = kv.first;
-      lt.pub_count = static_cast<int>(kv.second.size());
-      lt.sub_count = static_cast<int>(sub_infos.size());
-      lt.reliability = reliabilityToStr(kv.second.front().qos_profile().reliability());
-      lt.durability = durabilityToStr(kv.second.front().qos_profile().durability());
-      discovered.push_back(std::move(lt));
-    }
+    for (auto &kv : by_type) discovered.push_back(std::move(kv.second));
     publishers.emplace(entry.first, std::move(infos));
   }
   {
@@ -1062,7 +1205,7 @@ void ZenohBridgeNode::attachEgressRosSubscriptions() {
     if (!eg->rule.enabled || !eg->active.load()) continue;
     std::string topic, type;
     const std::string bare = "/" + eg->rel_topic;
-    const std::string prefixed = "/" + agent_id_ + bare;
+    const std::string prefixed = "/" + eg->agent_id + bare;
     const auto select = [&](const std::string &name) {
       const auto it = publishers.find(name);
       if (it == publishers.end()) return false;
@@ -1074,7 +1217,7 @@ void ZenohBridgeNode::attachEgressRosSubscriptions() {
       topic = name;
       return true;
     };
-    if (!select(prefixed) && !(allow_unprefixed_local_ && select(bare))) {
+    if (!select(prefixed) && !(allow_unprefixed && select(bare))) {
       if (eg->ros_sub) {
         ++eg->binding_generation;
         eg->ros_sub.reset();
@@ -1098,7 +1241,7 @@ void ZenohBridgeNode::attachEgressRosSubscriptions() {
                                        ? "transient_local"
                                        : "volatile";
     const auto metadata =
-        nlohmann::json{{"t", type}, {"s", agent_id_}, {"q", reliability}, {"d", durability}}.dump();
+        nlohmann::json{{"t", type}, {"s", eg->agent_id}, {"q", reliability}, {"d", durability}}.dump();
     const uint64_t generation = eg->binding_generation.load() + 1;
     try {
       std::weak_ptr<ActiveEgress> weak = eg;
@@ -1117,7 +1260,7 @@ void ZenohBridgeNode::attachEgressRosSubscriptions() {
       eg->last_error.clear();
       eg->binding_generation.store(generation);
       RCLCPP_INFO(get_logger(), "[%s] Egress bound: %s (%s, qos=%s/%s) -> %s",
-                  agent_id_.c_str(), topic.c_str(), type.c_str(),
+                  eg->agent_id.c_str(), topic.c_str(), type.c_str(),
                   reliability.c_str(), durability.c_str(), eg->zenoh_key.c_str());
       addLog("INFO", "Egress bound: " + topic + " (" + type + ", qos=" + reliability + "/" +
                          durability + ") -> " + eg->zenoh_key);
@@ -1182,7 +1325,7 @@ void ZenohBridgeNode::handleRosMessage(
     }
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                          "[%s] Zenoh put failed on %s: %s",
-                         agent_id_.c_str(), eg->zenoh_key.c_str(), e.what());
+                         configSnapshot()->agent_id.c_str(), eg->zenoh_key.c_str(), e.what());
     addLog("WARN", "Zenoh put failed on " + eg->zenoh_key + ": " + e.what());
   }
 }
@@ -1196,7 +1339,7 @@ void ZenohBridgeNode::handleZenohSample(const std::shared_ptr<ActiveIngress> &ig
   const std::string full_key(sample.get_keyexpr().as_string_view());
   std::string src_agent;
   std::string rel_topic;
-  if (!parseDataKey(domain_prefix_, full_key, src_agent, rel_topic)) {
+  if (!parseDataKey(ig->domain_prefix, full_key, src_agent, rel_topic)) {
     return;
   }
 
@@ -1216,7 +1359,7 @@ void ZenohBridgeNode::handleZenohSample(const std::shared_ptr<ActiveIngress> &ig
   if (!att_src.empty()) {
     src_agent = att_src;
   }
-  if (ig->rule.exclude_self && src_agent == agent_id_) {
+  if (ig->rule.exclude_self && src_agent == ig->agent_id) {
     return;
   }
   if (msg_type.empty()) {
@@ -1256,7 +1399,7 @@ void ZenohBridgeNode::handleZenohSample(const std::shared_ptr<ActiveIngress> &ig
       ig->last_error.clear();
       ep = slot;
       RCLCPP_INFO(get_logger(), "[%s] Ingress created: %s -> %s (%s)",
-                  agent_id_.c_str(), full_key.c_str(), local_topic.c_str(), msg_type.c_str());
+                  ig->agent_id.c_str(), full_key.c_str(), local_topic.c_str(), msg_type.c_str());
       addLog("INFO", "Ingress created: " + full_key + " -> " + local_topic + " (" + msg_type + ")");
     } catch (const std::exception &e) {
       {
@@ -1265,7 +1408,7 @@ void ZenohBridgeNode::handleZenohSample(const std::shared_ptr<ActiveIngress> &ig
       }
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                            "[%s] Failed to create ingress publisher %s (%s): %s",
-                           agent_id_.c_str(), local_topic.c_str(), msg_type.c_str(), e.what());
+                           ig->agent_id.c_str(), local_topic.c_str(), msg_type.c_str(), e.what());
       addLog("ERROR", "Ingress publisher failed for " + local_topic + " (" + msg_type + "): " + e.what());
       return;
     }
@@ -1299,7 +1442,7 @@ void ZenohBridgeNode::handleZenohSample(const std::shared_ptr<ActiveIngress> &ig
     }
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                          "[%s] Failed to publish ingress %s: %s",
-                         agent_id_.c_str(), local_topic.c_str(), e.what());
+                         ig->agent_id.c_str(), local_topic.c_str(), e.what());
     addLog("ERROR", "Ingress publish failed for " + local_topic + ": " + e.what());
   }
 }
@@ -1317,80 +1460,168 @@ void ZenohBridgeNode::handlePeerStatusSample(const zenoh::Sample &sample) {
 }
 
 nlohmann::json ZenohBridgeNode::buildLocalZenohInfoJson() const {
-  const auto snap = buildStatusSnapshot();
-  nlohmann::json effective_cfg;
-  try {
-    effective_cfg = nlohmann::json::parse(effective_zenoh_config_json_);
-  } catch (...) {
-    effective_cfg = effective_zenoh_config_json_;
-  }
+  const auto config = configSnapshot();
+  const auto &session = config->active_session;
+  AgentStatus ids;
+  readSessionIds(session, ids);
 
   std::vector<TransportInfo> transports;
   std::vector<LinkInfo> links;
 #if defined(Z_FEATURE_UNSTABLE_API)
-  {
-    std::lock_guard<std::mutex> slk(session_mutex_);
-    if (session_.has_value()) {
-      try {
-        for (const auto &t : session_->get_transports()) {
-          TransportInfo ti;
-          ti.zid = t.get_zid().to_string();
-          ti.whatami = std::string(zenoh::whatami_as_str(t.get_whatami()));
-          ti.is_qos = t.is_qos();
-          ti.is_multicast = t.is_multicast();
+  if (session) {
+    try {
+      for (const auto &t : session->get_transports()) {
+        TransportInfo ti;
+        ti.zid = t.get_zid().to_string();
+        ti.whatami = std::string(zenoh::whatami_as_str(t.get_whatami()));
+        ti.is_qos = t.is_qos();
+        ti.is_multicast = t.is_multicast();
 #if defined(Z_FEATURE_SHARED_MEMORY)
-          ti.is_shm = t.is_shm();
+        ti.is_shm = t.is_shm();
 #endif
-          transports.push_back(std::move(ti));
-        }
-      } catch (...) {
+        transports.push_back(std::move(ti));
       }
-      try {
-        for (const auto &l : session_->get_links()) {
-          LinkInfo li;
-          li.zid = l.get_zid().to_string();
-          li.src = l.get_src();
-          li.dst = l.get_dst();
-          li.mtu = l.get_mtu();
-          li.is_streamed = l.is_streamed();
-          li.interfaces = l.get_interfaces();
-          if (auto g = l.get_group()) li.group = *g;
-          if (auto a = l.get_auth_identifier()) li.auth_identifier = *a;
-          if (auto r = l.get_reliability()) {
-            li.reliability = (*r == Z_RELIABILITY_BEST_EFFORT) ? "best_effort" : "reliable";
-          }
-          if (auto p = l.get_priorities()) {
-            li.priorities = std::to_string(p->first) + "-" + std::to_string(p->second);
-          }
-          links.push_back(std::move(li));
+    } catch (...) {
+    }
+    try {
+      for (const auto &l : session->get_links()) {
+        LinkInfo li;
+        li.zid = l.get_zid().to_string();
+        li.src = l.get_src();
+        li.dst = l.get_dst();
+        li.mtu = l.get_mtu();
+        li.is_streamed = l.is_streamed();
+        li.interfaces = l.get_interfaces();
+        if (auto g = l.get_group()) li.group = *g;
+        if (auto a = l.get_auth_identifier()) li.auth_identifier = *a;
+        if (auto r = l.get_reliability()) {
+          li.reliability = (*r == Z_RELIABILITY_BEST_EFFORT) ? "best_effort" : "reliable";
         }
-      } catch (...) {
+        if (auto p = l.get_priorities()) {
+          li.priorities = std::to_string(p->first) + "-" + std::to_string(p->second);
+        }
+        links.push_back(std::move(li));
       }
+    } catch (...) {
     }
   }
 #endif
 
   return {
       {"ok", true},
-      {"agent_id", agent_id_},
+      {"agent_id", config->agent_id},
       {"default_agent_id", default_agent_id_},
-      {"zid", snap.zid},
-      {"peer_zids", snap.peer_zids},
-      {"router_zids", snap.router_zids},
+      {"zid", ids.zid},
+      {"peer_zids", ids.peer_zids},
+      {"router_zids", ids.router_zids},
       {"transports", transports},
       {"links", links},
-      {"bridge_settings", bridge_settings_},
-      {"session_config", session_cfg_},
-      {"effective_config", effective_cfg},
+      {"bridge_settings", config->bridge},
+      {"session_config", config->session},
+      {"effective_config", config->effective},
+      {"dds_shield", buildLocalDdsShieldJson()},
+  };
+}
+
+std::string ZenohBridgeNode::resolveShieldDomains(const std::string &configured_domains) const {
+  return configured_domains.empty() ? std::to_string(ros_domain_id_) : configured_domains;
+}
+
+// All runtime invocations (including status) hold the configuration writer
+// lock. Never hold the telemetry lock while waiting for the subprocess: Zenoh
+// callbacks must be able to return cached status during reconnect/verification.
+bool ZenohBridgeNode::runDdsShieldAction(const std::string &action,
+                                         std::string &out_msg,
+                                         const std::string &scope,
+                                         const std::string &domains,
+                                         BridgeSettings *installed) {
+  try {
+    const bool desired = configSnapshot()->bridge.dds_shield_enabled;
+    // A disabled configuration can legitimately retain a filter with different
+    // parameters. Inspect its actual shape rather than assume the staged domains.
+    const auto helper_action = action == "status" && !desired ? "snapshot" : action;
+    auto j = invokeDdsShield(dds_shield_script_, helper_action, scope, resolveShieldDomains(domains),
+                             bridge_settings_file_);
+    const bool active = j.at("active").get<bool>();
+    if (installed) {
+      installed->dds_shield_enabled = active;
+      if (active) {
+        installed->dds_shield_scope = j.at("scope").get<std::string>();
+        installed->dds_shield_domains = j.at("effective_domains").get<std::string>();
+        normalizeShieldPolicy(*installed);
+        if (installed->dds_shield_domains.empty()) throw std::runtime_error("Missing installed DDS Shield domains");
+      }
+      return true;  // Preflight only; do not clear an existing policy mismatch.
+    }
+    const auto rx = j.value("rx_dropped_packets", uint64_t{0});
+    const auto tx = j.value("tx_dropped_packets", uint64_t{0});
+    const bool mismatch = action == "status" && active != desired;
+    out_msg = mismatch ? "DDS Shield active state differs from configured policy" : j.value("message", "OK");
+    std::lock_guard<std::mutex> lk(dds_shield_mutex_);
+    dds_shield_active_ = active;
+    dds_shield_rx_dropped_ = rx;
+    dds_shield_tx_dropped_ = tx;
+    dds_shield_error_ = mismatch ? out_msg : "";
+    last_shield_poll_ns_ = nowSteadyNs();
+    return !mismatch;
+  } catch (const std::exception &e) {
+    out_msg = e.what();
+    std::lock_guard<std::mutex> lk(dds_shield_mutex_);
+    // Verification failed. Never advertise an old verified 'active' as current.
+    dds_shield_active_ = false;
+    dds_shield_rx_dropped_ = dds_shield_tx_dropped_ = 0;
+    dds_shield_error_ = out_msg;
+    last_shield_poll_ns_ = nowSteadyNs();
+    return false;
+  }
+}
+
+void ZenohBridgeNode::pollDdsShieldStatus() {
+  std::unique_lock<std::mutex> writer(reconfigure_mutex_, std::try_to_lock);
+  if (!writer.owns_lock() || dds_shield_script_.empty()) return;
+  const auto config = configSnapshot();
+  {
+    std::lock_guard<std::mutex> lk(dds_shield_mutex_);
+    if ((!dds_shield_active_ && !config->bridge.dds_shield_enabled && dds_shield_error_.empty()) ||
+        nowSteadyNs() - last_shield_poll_ns_ < 5000000000LL) return;
+  }
+  std::string msg;
+  runDdsShieldAction("status", msg, config->bridge.dds_shield_scope, config->bridge.dds_shield_domains);
+}
+
+nlohmann::json ZenohBridgeNode::refreshDdsShieldStatus() {
+  std::lock_guard<std::mutex> writer(reconfigure_mutex_);
+  const auto config = configSnapshot();
+  std::string msg;
+  runDdsShieldAction("status", msg, config->bridge.dds_shield_scope, config->bridge.dds_shield_domains);
+  return buildLocalDdsShieldJson();
+}
+
+nlohmann::json ZenohBridgeNode::buildLocalDdsShieldJson() const {
+  const auto config = configSnapshot();
+  std::error_code ec;
+  const bool available = std::filesystem::is_regular_file(dds_shield_script_, ec);
+  std::lock_guard<std::mutex> lk(dds_shield_mutex_);
+  return {
+      {"ok", dds_shield_error_.empty()},
+      {"agent_id", config->agent_id},
+      {"enabled", config->bridge.dds_shield_enabled},
+      {"active", dds_shield_active_},
+      {"scope", config->bridge.dds_shield_scope},
+      {"domains", config->bridge.dds_shield_domains},
+      {"effective_domains", resolveShieldDomains(config->bridge.dds_shield_domains)},
+      {"rx_dropped_packets", dds_shield_rx_dropped_},
+      {"tx_dropped_packets", dds_shield_tx_dropped_},
+      {"error", dds_shield_error_},
+      {"message", dds_shield_error_.empty() ? "OK" : dds_shield_error_},
+      {"available", available},
   };
 }
 
 void ZenohBridgeNode::handleControlQuery(const zenoh::Query &query) {
+  const auto config = configSnapshot();
   nlohmann::json reply{{"ok", false}, {"message", "Invalid request"}};
-  std::optional<SessionConfig> deferred_session;
-  bool deferred_session_save = true;
-  std::optional<BridgeSettings> deferred_bridge_settings;
-  bool deferred_bridge_save = true;
+  std::function<void(ZenohBridgeNode &)> deferred;
 
   try {
     nlohmann::json req = nlohmann::json::object();
@@ -1409,37 +1640,41 @@ void ZenohBridgeNode::handleControlQuery(const zenoh::Query &query) {
       reply = nlohmann::json{
           {"ok", true},
           {"message", "OK"},
-          {"status", buildStatusSnapshot()},
-          {"bridge_settings", bridge_settings_},
-          {"session_config", session_cfg_},
+          {"status", buildStatusSnapshot(*config)},
+          {"bridge_settings", config->bridge},
+          {"session_config", config->session},
       };
     } else if (action == "get_zenoh_info") {
       reply = buildLocalZenohInfoJson();
     } else if (action == "set_session") {
-      SessionConfig next_cfg = session_cfg_;
+      SessionConfig next_cfg = config->session;
       if (req.contains("session") && req["session"].is_object()) {
         next_cfg = req["session"].get<SessionConfig>();
       }
       std::string preview;
       auto validated = buildZenohConfig(next_cfg, preview);
       (void)validated;
-      deferred_session = std::move(next_cfg);
-      deferred_session_save = req.value("save", true);
+      deferred = [cfg = std::move(next_cfg), save = req.value("save", true)](ZenohBridgeNode &node) {
+        std::string msg;
+        node.reconnectSession(cfg, save, msg);
+      };
       reply = nlohmann::json{
           {"ok", true},
-          {"message", "Remote Zenoh config validated; reconnecting session on " + agent_id_},
+          {"message", "Remote Zenoh config validated; reconnecting session on " + config->agent_id},
       };
-    } else if (action == "set_bridge_settings") {
-      BridgeSettings next_bs = bridge_settings_;
-      if (req.contains("bridge_settings") && req["bridge_settings"].is_object()) {
-        next_bs = req["bridge_settings"].get<BridgeSettings>();
+    } else if (action == "set_bridge_settings" || action == "patch_bridge_settings") {
+      const auto &patch = req.at("bridge_settings");
+      const auto proposed = mergedBridgeSettings(config->bridge, patch);
+      if (shieldPolicyChanged(proposed, config->bridge)) {
+        reply = {{"ok", false}, {"message", kShieldWriteDenied}};
+      } else {
+        deferred = [patch, save = req.value("save", true)](ZenohBridgeNode &node) {
+          std::string msg;
+          if (node.updateBridgeSettings(patch, save, false, msg) != 200)
+            node.addLog("WARN", "Deferred settings rejected: " + msg);
+        };
+        reply = {{"ok", true}, {"queued", true}, {"message", "Queued bridge settings on " + config->agent_id}};
       }
-      deferred_bridge_settings = std::move(next_bs);
-      deferred_bridge_save = req.value("save", true);
-      reply = nlohmann::json{
-          {"ok", true},
-          {"message", "Updating bridge settings on " + agent_id_},
-      };
     } else if (action == "apply" || action == "apply_and_save") {
       RuleSet rs;
       if (req.contains("preset") && req["preset"].is_string()) {
@@ -1459,7 +1694,7 @@ void ZenohBridgeNode::handleControlQuery(const zenoh::Query &query) {
           {"ok", ok},
           {"message", msg},
           {"saved", ok && persist && !rules_file_.empty()},
-          {"status", buildStatusSnapshot()},
+          {"status", buildStatusSnapshot(*config)},
       };
     } else if (action == "save") {
       if (rules_file_.empty()) {
@@ -1472,12 +1707,16 @@ void ZenohBridgeNode::handleControlQuery(const zenoh::Query &query) {
     } else if (action == "logs") {
       reply = nlohmann::json{
           {"ok", true},
-          {"agent_id", agent_id_},
+          {"agent_id", config->agent_id},
           {"logs", getRecentLogs(250)},
       };
     } else if (action == "clear_logs") {
       clearLogs();
-      reply = nlohmann::json{{"ok", true}, {"agent_id", agent_id_}};
+      reply = nlohmann::json{{"ok", true}, {"agent_id", config->agent_id}};
+    } else if (action == "get_dds_shield") {
+      reply = buildLocalDdsShieldJson();  // Cached only: peers cannot invoke the privileged helper.
+    } else if (action == "set_dds_shield") {
+      reply = {{"ok", false}, {"message", kShieldWriteDenied}};
     } else {
       reply = nlohmann::json{{"ok", false}, {"message", "Unknown action: " + action}};
     }
@@ -1488,25 +1727,14 @@ void ZenohBridgeNode::handleControlQuery(const zenoh::Query &query) {
   try {
     query.reply(query.get_keyexpr(), zenoh::Bytes(reply.dump()));
   } catch (const std::exception &e) {
-    RCLCPP_WARN(get_logger(), "[%s] Control reply failed: %s", agent_id_.c_str(), e.what());
+    RCLCPP_WARN(get_logger(), "[%s] Control reply failed: %s", config->agent_id.c_str(), e.what());
   }
 
-  // Defer session/settings reconnect off the Zenoh callback thread to avoid deadlock!
-  if (deferred_session.has_value()) {
-    SessionConfig cfg_copy = *deferred_session;
-    std::thread([this, cfg_copy, deferred_session_save]() {
+  // Defer reconnect off the Zenoh callback thread; the node may stop before it runs.
+  if (deferred) {
+    std::thread([weak = weak_from_this(), run = std::move(deferred)]() {
       std::this_thread::sleep_for(std::chrono::milliseconds(80));
-      if (shutting_down_.load(std::memory_order_acquire)) return;
-      std::string msg;
-      reconnectSession(cfg_copy, deferred_session_save, msg);
-    }).detach();
-  } else if (deferred_bridge_settings.has_value()) {
-    BridgeSettings bs_copy = *deferred_bridge_settings;
-    std::thread([this, bs_copy, deferred_bridge_save]() {
-      std::this_thread::sleep_for(std::chrono::milliseconds(80));
-      if (shutting_down_.load(std::memory_order_acquire)) return;
-      std::string msg;
-      updateBridgeSettings(bs_copy, deferred_bridge_save, msg);
+      if (auto node = std::static_pointer_cast<ZenohBridgeNode>(weak.lock())) run(*node);
     }).detach();
   }
 }
@@ -1514,8 +1742,14 @@ void ZenohBridgeNode::handleControlQuery(const zenoh::Query &query) {
 nlohmann::json ZenohBridgeNode::queryRemoteAgent(const std::string &target_agent_id,
                                                  const nlohmann::json &request_body,
                                                  uint64_t timeout_ms) {
-  std::lock_guard<std::mutex> slk(session_mutex_);
-  if (!session_.has_value()) {
+  std::shared_ptr<zenoh::Session> session;
+  std::string key;
+  {
+    const auto config = configSnapshot();
+    session = config->active_session;
+    key = makeControlKey(config->bridge.domain_prefix, target_agent_id);
+  }
+  if (!session) {
     return {{"ok", false}, {"message", "Zenoh session not open"}};
   }
 
@@ -1525,12 +1759,13 @@ nlohmann::json ZenohBridgeNode::queryRemoteAgent(const std::string &target_agent
     opts.timeout_ms = timeout_ms;
     opts.payload = zenoh::Bytes(request_body.dump());
 
-    auto replies = session_->get(
-        zenoh::KeyExpr(makeControlKey(domain_prefix_, target_agent_id)),
-        "", zenoh::channels::FifoChannel(16), std::move(opts));
+    if (!http_server_.isRunning()) return {{"ok", false}, {"message", "HTTP server is stopping"}};
+    auto replies = std::make_shared<HttpReplies>();
+    session->get(zenoh::KeyExpr(key), "", replies->onReply(), replies->onDone(), std::move(opts));
+    session.reset();
 
-    for (auto res = replies.recv(); std::holds_alternative<zenoh::Reply>(res); res = replies.recv()) {
-      const auto &rep = std::get<zenoh::Reply>(res);
+    while (auto reply = replies->next(http_server_)) {
+      const auto &rep = *reply;
       if (rep.is_ok()) {
         const std::string text = rep.get_ok().get_payload().as_string();
         return nlohmann::json::parse(text);
@@ -1564,33 +1799,49 @@ void ZenohBridgeNode::onStatusTimer() {
     }
   }
 
-  AgentStatus snap = buildStatusSnapshot();
+  const auto config = configSnapshot();
+  AgentStatus snap = buildStatusSnapshot(*config);
   {
     std::lock_guard<std::mutex> plk(peers_mutex_);
-    remote_agents_[agent_id_] = snap;
-    remote_last_seen_ms_[agent_id_] = nowEpochMs();
+    remote_agents_[snap.agent_id] = snap;
+    remote_last_seen_ms_[snap.agent_id] = nowEpochMs();
   }
 
   std::lock_guard<std::mutex> slk(session_mutex_);
-  if (!status_pub_.has_value()) return;
+  if (!status_pub_ || configSnapshot()->active_session != config->active_session) return;
   try {
     nlohmann::json j = snap;
     status_pub_->put(zenoh::Bytes(j.dump()));
   } catch (const std::exception &e) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
-                         "[%s] Status publish failed: %s", agent_id_.c_str(), e.what());
+                         "[%s] Status publish failed: %s", snap.agent_id.c_str(), e.what());
   }
 }
 
-AgentStatus ZenohBridgeNode::buildStatusSnapshot() const {
+void ZenohBridgeNode::readSessionIds(const std::shared_ptr<zenoh::Session> &session, AgentStatus &st) {
+  if (session) {
+    try {
+      st.zid = session->get_zid().to_string();
+      for (const auto &id : session->get_peers_z_id()) {
+        st.peer_zids.push_back(id.to_string());
+      }
+      for (const auto &id : session->get_routers_z_id()) {
+        st.router_zids.push_back(id.to_string());
+      }
+    } catch (...) {
+    }
+  }
+}
+
+AgentStatus ZenohBridgeNode::buildStatusSnapshot(const RuntimeConfig &config) const {
   AgentStatus st;
   st.schema = kProtocolSchemaVersion;
-  st.agent_id = agent_id_;
+  st.agent_id = config.agent_id;
   st.robot_type = robot_type_;
   st.hostname = hostname_;
   st.ros_distro = ros_distro_;
-  st.zenoh_mode = session_cfg_.mode;
-  st.domain_prefix = domain_prefix_;
+  st.zenoh_mode = config.session.mode;
+  st.domain_prefix = config.bridge.domain_prefix;
   st.timestamp_ms = nowEpochMs();
   st.uptime_sec = std::max<int64_t>(0, (st.timestamp_ms - started_epoch_ms_) / 1000);
   {
@@ -1598,63 +1849,33 @@ AgentStatus ZenohBridgeNode::buildStatusSnapshot() const {
     st.warn_count = warn_count_;
     st.error_count = error_count_;
   }
-
+  st.dds_shield_enabled = config.bridge.dds_shield_enabled;
+  st.dds_shield_scope = config.bridge.dds_shield_scope;
+  st.dds_shield_domains = resolveShieldDomains(config.bridge.dds_shield_domains);
   {
-    std::lock_guard<std::mutex> slk(session_mutex_);
-    if (session_.has_value()) {
-      try {
-        st.zid = session_->get_zid().to_string();
-        for (const auto &id : session_->get_peers_z_id()) {
-          st.peer_zids.push_back(id.to_string());
-        }
-        for (const auto &id : session_->get_routers_z_id()) {
-          st.router_zids.push_back(id.to_string());
-        }
-      } catch (...) {
-      }
-    }
+    std::lock_guard<std::mutex> slk(dds_shield_mutex_);
+    st.dds_shield_active = dds_shield_active_;
+    st.dds_shield_rx_dropped = dds_shield_rx_dropped_;
+    st.dds_shield_tx_dropped = dds_shield_tx_dropped_;
+    st.dds_shield_error = dds_shield_error_;
   }
+
+  readSessionIds(config.active_session, st);
 
   std::lock_guard<std::mutex> lk(state_mutex_);
   st.local_topics = cached_local_topics_;
-  st.egress.reserve(egress_list_.size());
-  for (const auto &e : egress_list_) {
-    EgressRule r = e->rule;
-    r.resolved_type = e->resolved_type;
-    r.bound_topic = e->local_topic;
-    r.effective_key = e->zenoh_key;
-    r.last_error = e->last_error;
-    r.actual_hz = e->last_hz;
-    r.kbps = e->last_kbps;
-    r.tx_count = e->tx_count.load(std::memory_order_relaxed);
-    r.dropped_count = e->dropped_count.load(std::memory_order_relaxed);
-    r.has_subscribers = e->has_subscribers.load(std::memory_order_relaxed);
-    st.total_tx_kbps += r.kbps;
-    st.egress.push_back(std::move(r));
-  }
-  st.ingress.reserve(ingress_list_.size());
-  for (const auto &i : ingress_list_) {
-    IngressRule r = i->rule;
-    r.actual_hz = i->last_hz;
-    r.kbps = i->last_kbps;
-    r.rx_count = i->rx_count.load(std::memory_order_relaxed);
-    r.dropped_count = i->dropped_count.load(std::memory_order_relaxed);
-    {
-      std::lock_guard<std::mutex> elk(i->endpoints_mutex);
-      for (const auto &kv : i->endpoints) {
-        r.active_endpoints.push_back(kv.first);
-      }
-      r.last_error = i->last_error;
-    }
-    st.total_rx_kbps += r.kbps;
-    st.ingress.push_back(std::move(r));
-  }
+  auto rules = snapshotRulesLocked();
+  st.egress = std::move(rules.egress);
+  st.ingress = std::move(rules.ingress);
+  for (const auto &rule : st.egress) st.total_tx_kbps += rule.kbps;
+  for (const auto &rule : st.ingress) st.total_rx_kbps += rule.kbps;
   return st;
 }
 
 // ---------------- HTTP REST API ----------------
 
 HttpResponse ZenohBridgeNode::handleHttpRequest(const HttpRequest &req) {
+  const auto config = configSnapshot();
   auto makeJson = [](int status, const nlohmann::json &j) {
     HttpResponse r;
     r.status = status;
@@ -1668,14 +1889,14 @@ HttpResponse ZenohBridgeNode::handleHttpRequest(const HttpRequest &req) {
   }
 
   if (req.method == "GET" && (path == "/health" || path == "/status")) {
-    const auto snap = buildStatusSnapshot();
+    const auto snap = buildStatusSnapshot(*config);
     return makeJson(200, {
         {"ok", true},
-        {"local_agent_id", agent_id_},
+        {"local_agent_id", config->agent_id},
         {"default_agent_id", default_agent_id_},
         {"status", snap},
-        {"bridge_settings", bridge_settings_},
-        {"session_config", session_cfg_},
+        {"bridge_settings", config->bridge},
+        {"session_config", config->session},
         {"rules_file", rules_file_},
     });
   }
@@ -1683,22 +1904,26 @@ HttpResponse ZenohBridgeNode::handleHttpRequest(const HttpRequest &req) {
   if (req.method == "GET" && path == "/agents") {
     const int64_t now_ms = nowEpochMs();
     nlohmann::json arr = nlohmann::json::array();
-    auto local_snap = buildStatusSnapshot();
+    auto local_snap = buildStatusSnapshot(*config);
     {
       std::lock_guard<std::mutex> plk(peers_mutex_);
-      remote_agents_[agent_id_] = local_snap;
-      remote_last_seen_ms_[agent_id_] = now_ms;
+      remote_agents_[config->agent_id] = local_snap;
+      remote_last_seen_ms_[config->agent_id] = now_ms;
       for (const auto &kv : remote_agents_) {
         const int64_t seen = remote_last_seen_ms_.count(kv.first) ? remote_last_seen_ms_.at(kv.first) : 0;
-        const bool online = (kv.first == agent_id_) || ((now_ms - seen) < 5000);
+        const bool online = (kv.first == config->agent_id) || ((now_ms - seen) < 5000);
         nlohmann::json item = kv.second;
-        item["is_local"] = (kv.first == agent_id_);
+        item["is_local"] = (kv.first == config->agent_id);
+        if (kv.first == config->agent_id) {
+          // Empty is a policy (follow ROS_DOMAIN_ID); snapshot domains are the effective ports' domains.
+          item["dds_shield_configured_domains"] = config->bridge.dds_shield_domains;
+        }
         item["online"] = online;
         item["last_seen_ms"] = seen;
         arr.push_back(std::move(item));
       }
     }
-    return makeJson(200, {{"ok", true}, {"local_agent_id", agent_id_}, {"agents", arr}});
+    return makeJson(200, {{"ok", true}, {"local_agent_id", config->agent_id}, {"agents", arr}});
   }
 
   if (req.method == "GET" && path == "/local/topics") {
@@ -1710,19 +1935,19 @@ HttpResponse ZenohBridgeNode::handleHttpRequest(const HttpRequest &req) {
   if (req.method == "GET" && path == "/logs") {
     const std::string target = req.query_params.count("agent_id")
                                    ? req.query_params.at("agent_id")
-                                   : agent_id_;
-    if (target.empty() || target == agent_id_) {
-      return makeJson(200, {{"ok", true}, {"agent_id", agent_id_}, {"logs", getRecentLogs(250)}});
+                                   : config->agent_id;
+    if (target.empty() || target == config->agent_id) {
+      return makeJson(200, {{"ok", true}, {"agent_id", config->agent_id}, {"logs", getRecentLogs(250)}});
     }
     return makeJson(200, queryRemoteAgent(target, {{"action", "logs"}}));
   }
 
   if (req.method == "POST" && path == "/logs/clear") {
     nlohmann::json body = nlohmann::json::parse(req.body.empty() ? "{}" : req.body);
-    const std::string target = body.value("agent_id", agent_id_);
-    if (target.empty() || target == agent_id_) {
+    const std::string target = body.value("agent_id", config->agent_id);
+    if (target.empty() || target == config->agent_id) {
       clearLogs();
-      return makeJson(200, {{"ok", true}, {"agent_id", agent_id_}});
+      return makeJson(200, {{"ok", true}, {"agent_id", config->agent_id}});
     }
     return makeJson(200, queryRemoteAgent(target, {{"action", "clear_logs"}}));
   }
@@ -1730,13 +1955,13 @@ HttpResponse ZenohBridgeNode::handleHttpRequest(const HttpRequest &req) {
   if (req.method == "GET" && path == "/rules") {
     const std::string target = req.query_params.count("agent_id")
                                    ? req.query_params.at("agent_id")
-                                   : agent_id_;
-    if (target.empty() || target == agent_id_) {
+                                   : config->agent_id;
+    if (target.empty() || target == config->agent_id) {
       attachEgressRosSubscriptions();
       return makeJson(200, {
           {"ok", true},
-          {"agent_id", agent_id_},
-          {"status", buildStatusSnapshot()},
+          {"agent_id", config->agent_id},
+          {"status", buildStatusSnapshot(*config)},
       });
     }
     return makeJson(200, queryRemoteAgent(target, {{"action", "scan_topics"}}));
@@ -1747,9 +1972,9 @@ HttpResponse ZenohBridgeNode::handleHttpRequest(const HttpRequest &req) {
     const std::string target = body.value("agent_id",
                                           req.query_params.count("agent_id")
                                               ? req.query_params.at("agent_id")
-                                              : agent_id_);
+                                              : config->agent_id);
     const bool save = body.value("save", false);
-    if (target.empty() || target == agent_id_) {
+    if (target.empty() || target == config->agent_id) {
       RuleSet rs;
       if (body.contains("preset") && body["preset"].is_string()) {
         rs = makePresetRules(body["preset"].get<std::string>());
@@ -1767,7 +1992,7 @@ HttpResponse ZenohBridgeNode::handleHttpRequest(const HttpRequest &req) {
           {"ok", ok},
           {"message", msg},
           {"saved", ok && save && !rules_file_.empty()},
-          {"status", buildStatusSnapshot()},
+          {"status", buildStatusSnapshot(*config)},
       });
     }
     nlohmann::json rpc = body;
@@ -1778,7 +2003,7 @@ HttpResponse ZenohBridgeNode::handleHttpRequest(const HttpRequest &req) {
   if (req.method == "POST" && path == "/preset") {
     nlohmann::json body = nlohmann::json::parse(req.body.empty() ? "{}" : req.body);
     const std::string preset = body.value("preset", "formation");
-    const std::string target = body.value("agent_id", agent_id_);
+    const std::string target = body.value("agent_id", config->agent_id);
     const bool save = body.value("save", false);
 
     if (target == "*" || target == "all") {
@@ -1789,13 +2014,13 @@ HttpResponse ZenohBridgeNode::handleHttpRequest(const HttpRequest &req) {
         std::lock_guard<std::mutex> plk(peers_mutex_);
         for (const auto &kv : remote_agents_) {
           const int64_t seen = remote_last_seen_ms_.count(kv.first) ? remote_last_seen_ms_.at(kv.first) : 0;
-          if (kv.first == agent_id_ || (now_ms - seen) < 5000) {
+          if (kv.first == config->agent_id || (now_ms - seen) < 5000) {
             targets.push_back(kv.first);
           }
         }
       }
       for (const auto &aid : targets) {
-        if (aid == agent_id_) {
+        if (aid == config->agent_id) {
           std::string msg;
           bool ok = applyRules(makePresetRules(preset), save, msg);
           results[aid] = {{"ok", ok}, {"message", msg}};
@@ -1809,13 +2034,13 @@ HttpResponse ZenohBridgeNode::handleHttpRequest(const HttpRequest &req) {
       return makeJson(200, {{"ok", true}, {"preset", preset}, {"results", results}});
     }
 
-    if (target == agent_id_) {
+    if (target == config->agent_id) {
       std::string msg;
       const bool ok = applyRules(makePresetRules(preset), save, msg);
       return makeJson(ok ? 200 : 400, {
           {"ok", ok},
           {"message", msg},
-          {"status", buildStatusSnapshot()},
+          {"status", buildStatusSnapshot(*config)},
       });
     }
     return makeJson(200, queryRemoteAgent(target, {
@@ -1825,40 +2050,105 @@ HttpResponse ZenohBridgeNode::handleHttpRequest(const HttpRequest &req) {
   }
 
   // Bridge settings (migrated from AivudaOS config panel -> Web UI, local OR remote)
-  if (req.method == "POST" && path == "/bridge/settings") {
+  if (req.method == "POST" && (path == "/bridge/settings" || path == "/dds_shield")) {
     nlohmann::json body = nlohmann::json::parse(req.body.empty() ? "{}" : req.body);
-    const std::string target = body.value("agent_id", agent_id_);
-    const bool save = body.value("save", true);
-    BridgeSettings next_bs = bridge_settings_;
-    if (body.contains("bridge_settings") && body["bridge_settings"].is_object()) {
-      next_bs = body["bridge_settings"].get<BridgeSettings>();
-    } else {
-      next_bs = body.get<BridgeSettings>();
-    }
-    if (target.empty() || target == agent_id_) {
+    const auto selector = req.query_params.find("agent_id");
+    const auto target = body.value("agent_id", selector == req.query_params.end() ? config->agent_id : selector->second);
+    if (selector != req.query_params.end() && selector->second != target)
+      return makeJson(400, {{"ok", false}, {"message", "Conflicting target agent IDs"}});
+    if (path == "/dds_shield") {
+      if ((!target.empty() && target != config->agent_id) || !req.shield_admin)
+        return makeJson(403, {{"ok", false}, {"message", kShieldWriteDenied}});
+      nlohmann::json patch = nlohmann::json::object();
+      for (const char *field : {"enabled", "scope", "domains"}) {
+        if (body.contains(field)) patch[std::string("dds_shield_") + field] = body.at(field);
+      }
+      if (patch.empty()) return makeJson(400, {{"ok", false}, {"message", "No DDS Shield settings supplied"}});
       std::string msg;
-      const bool ok = updateBridgeSettings(next_bs, save, msg);
-      return makeJson(ok ? 200 : 400, {
-          {"ok", ok},
-          {"message", msg},
-          {"agent_id", agent_id_},
-          {"bridge_settings", bridge_settings_},
-          {"status", buildStatusSnapshot()},
+      const int code = updateBridgeSettings(patch, body.value("save", true), true, msg, true,
+                                            body.value("expected_policy", nlohmann::json(nullptr)));
+      auto res = buildLocalDdsShieldJson();
+      res["ok"] = code == 200;
+      res["message"] = msg;
+      return makeJson(code, res);
+    }
+
+    const bool save = body.value("save", true);
+    auto patch = body.contains("bridge_settings") ? body.at("bridge_settings") : body;
+    if (!patch.is_object()) return makeJson(400, {{"ok", false}, {"message", "Expected bridge settings object"}});
+    if (!body.contains("bridge_settings")) {
+      patch.erase("agent_id");  // Flat request uses this field to select its target.
+      patch.erase("save");
+    }
+    if (target.empty() || target == config->agent_id) {
+      std::string msg;
+      const int code = updateBridgeSettings(patch, save, req.shield_admin, msg);
+      const auto updated = configSnapshot();
+      return makeJson(code, {
+          {"ok", code == 200}, {"message", msg}, {"agent_id", updated->agent_id},
+          {"bridge_settings", updated->bridge}, {"status", buildStatusSnapshot(*updated)},
       });
     }
-    return makeJson(200, queryRemoteAgent(target, {
-        {"action", "set_bridge_settings"},
-        {"save", save},
-        {"bridge_settings", next_bs},
-    }));
+    // A remote UI may have round-tripped a full settings object. Only forward
+    // unrelated fields; reject policy edits rather than silently ignoring them.
+    if (hasShieldFields(patch)) {
+      const auto remote = queryRemoteAgent(target, {{"action", "get"}});
+      if (!remote.value("ok", false)) return makeJson(503, remote);
+      try {
+        const auto bs = remote.at("bridge_settings").get<BridgeSettings>();
+        if (shieldPolicyChanged(mergedBridgeSettings(bs, patch), bs))
+          return makeJson(403, {{"ok", false}, {"message", kShieldWriteDenied}});
+      } catch (const std::exception &e) {
+        return makeJson(400, {{"ok", false}, {"message", e.what()}});
+      }
+      for (const char *field : kShieldFields) patch.erase(field);
+    }
+    auto res = queryRemoteAgent(target, {{"action", "patch_bridge_settings"}, {"save", save},
+                                         {"bridge_settings", patch}});
+    // 2.1 only implements replacement. Never retry ambiguous writes (e.g. timeout),
+    // wildcard targets, or a peer whose settings could include a shield policy.
+    if (!res.value("ok", false) && res.value("message", "") == "Unknown action: patch_bridge_settings" &&
+        target.find('*') == std::string::npos) {
+      const auto peer = queryRemoteAgent(target, {{"action", "get"}});
+      if (!peer.value("ok", false)) return makeJson(503, peer);
+      const auto settings = peer.find("bridge_settings");
+      const auto status = peer.find("status");
+      const nlohmann::json legacy_shape = {{"agent_id", ""}, {"domain_prefix", ""}, {"default_preset", ""},
+                                           {"allow_unprefixed_local", true}, {"liveliness_enabled", true}};
+      if (settings != peer.end() && settings->is_object() && settings->size() == legacy_shape.size() &&
+          status != peer.end() && status->is_object() && status->value("agent_id", "") == target &&
+          !hasShieldFields(*status)) {
+        auto replacement = *settings;
+        for (const auto &[key, sample] : legacy_shape.items()) {
+          if (!settings->contains(key) || settings->at(key).type() != sample.type()) return makeJson(400, res);
+        }
+        for (const auto &[key, value] : patch.items()) {
+          if (!legacy_shape.contains(key) || value.type() != legacy_shape.at(key).type())
+            return makeJson(400, {{"ok", false}, {"message", "Unsupported 2.1 bridge setting: " + key}});
+          replacement[key] = value;
+        }
+        res = queryRemoteAgent(target, {{"action", "set_bridge_settings"}, {"save", save},
+                                        {"bridge_settings", replacement}});
+      }
+    }
+    return makeJson(res.value("ok", false) ? 200 : 400, res);
   }
+
+  if (req.method == "GET" && path == "/dds_shield") {
+    const std::string target = req.query_params.count("agent_id")
+                                   ? req.query_params.at("agent_id") : config->agent_id;
+    auto res = (target.empty() || target == config->agent_id) ? refreshDdsShieldStatus()
+        : queryRemoteAgent(target, {{"action", "get_dds_shield"}});
+    return makeJson(res.value("ok", false) ? 200 : 503, res);
+  }
+
 
   // Zenoh Engine Info (local OR remote!)
   if (req.method == "GET" && path == "/zenoh/info") {
     const std::string target = req.query_params.count("agent_id")
                                    ? req.query_params.at("agent_id")
-                                   : agent_id_;
-    if (target.empty() || target == agent_id_) {
+                                   : config->agent_id;
+    if (target.empty() || target == config->agent_id) {
       return makeJson(200, buildLocalZenohInfoJson());
     }
     return makeJson(200, queryRemoteAgent(target, {{"action", "get_zenoh_info"}}));
@@ -1901,8 +2191,8 @@ HttpResponse ZenohBridgeNode::handleHttpRequest(const HttpRequest &req) {
   // Reconnect Zenoh Session (local OR remote!)
   if (req.method == "POST" && path == "/zenoh/session") {
     nlohmann::json body = nlohmann::json::parse(req.body.empty() ? "{}" : req.body);
-    const std::string target = body.value("agent_id", agent_id_);
-    SessionConfig next_cfg = session_cfg_;
+    const std::string target = body.value("agent_id", config->agent_id);
+    SessionConfig next_cfg;
     if (body.contains("session") && body["session"].is_object()) {
       next_cfg = body["session"].get<SessionConfig>();
     } else {
@@ -1910,14 +2200,15 @@ HttpResponse ZenohBridgeNode::handleHttpRequest(const HttpRequest &req) {
     }
     const bool persist = body.value("save", true);
 
-    if (target.empty() || target == agent_id_) {
+    if (target.empty() || target == config->agent_id) {
       std::string msg;
       const bool ok = reconnectSession(next_cfg, persist, msg);
+      const auto updated = configSnapshot();
       return makeJson(ok ? 200 : 400, {
           {"ok", ok},
           {"message", msg},
-          {"session_config", session_cfg_},
-          {"status", buildStatusSnapshot()},
+          {"session_config", updated->session},
+          {"status", buildStatusSnapshot(*updated)},
       });
     }
     return makeJson(200, queryRemoteAgent(target, {
@@ -1937,19 +2228,17 @@ HttpResponse ZenohBridgeNode::handleHttpRequest(const HttpRequest &req) {
     return makeJson(200, handleZenohDeleteApi(body));
   }
 
-  if (req.method == "POST" && path == "/zenoh/get") {
-    nlohmann::json body = nlohmann::json::parse(req.body.empty() ? "{}" : req.body);
-    return makeJson(200, handleZenohGetApi(body));
+  if (req.method == "POST" && (path == "/zenoh/get" || path == "/zenoh/liveliness/get")) {
+    const auto body = nlohmann::json::parse(req.body.empty() ? "{}" : req.body);
+    const bool liveliness = path == "/zenoh/liveliness/get";
+    const auto timeout = httpQueryTimeout(body, liveliness ? 2000 : 3000);
+    if (!timeout) return makeJson(400, {{"ok", false}, {"message", kTimeoutError}});
+    return makeJson(200, liveliness ? handleLivelinessGetApi(body, *timeout) : handleZenohGetApi(body, *timeout));
   }
 
   if (req.method == "POST" && path == "/zenoh/scout") {
     nlohmann::json body = nlohmann::json::parse(req.body.empty() ? "{}" : req.body);
     return makeJson(200, handleZenohScoutApi(body));
-  }
-
-  if (req.method == "POST" && path == "/zenoh/liveliness/get") {
-    nlohmann::json body = nlohmann::json::parse(req.body.empty() ? "{}" : req.body);
-    return makeJson(200, handleLivelinessGetApi(body));
   }
 
   if (req.method == "POST" && path == "/zenoh/liveliness/declare") {
@@ -1969,7 +2258,7 @@ HttpResponse ZenohBridgeNode::handleHttpRequest(const HttpRequest &req) {
     std::vector<std::string> observed(observed_liveliness_keys_.begin(), observed_liveliness_keys_.end());
     return makeJson(200, {
         {"ok", true},
-        {"own_token", liveliness_enabled_ ? makeLivelinessKey(domain_prefix_, agent_id_) : ""},
+        {"own_token", config->bridge.liveliness_enabled ? makeLivelinessKey(config->bridge.domain_prefix, config->agent_id) : ""},
         {"custom_tokens", custom_keys},
         {"observed_tokens", observed},
     });
@@ -2032,7 +2321,8 @@ nlohmann::json ZenohBridgeNode::handleZenohPutApi(const nlohmann::json &body) {
   const std::string attachment = body.value("attachment", "");
 
   std::lock_guard<std::mutex> slk(session_mutex_);
-  if (!session_.has_value()) {
+  const auto session = configSnapshot()->active_session;
+  if (!session) {
     return {{"ok", false}, {"message", "Zenoh session not open"}};
   }
   try {
@@ -2050,7 +2340,7 @@ nlohmann::json ZenohBridgeNode::handleZenohPutApi(const nlohmann::json &body) {
     if (!attachment.empty()) {
       opts.attachment = zenoh::Bytes(attachment);
     }
-    session_->put(zenoh::KeyExpr(key), zenoh::Bytes(payload), std::move(opts));
+    session->put(zenoh::KeyExpr(key), zenoh::Bytes(payload), std::move(opts));
     return {{"ok", true}, {"message", "PUT sent to " + key}, {"bytes", payload.size()}};
   } catch (const std::exception &e) {
     return {{"ok", false}, {"message", std::string("PUT failed: ") + e.what()}};
@@ -2068,7 +2358,8 @@ nlohmann::json ZenohBridgeNode::handleZenohDeleteApi(const nlohmann::json &body)
   const std::string reliability_str = body.value("reliability", "reliable");
 
   std::lock_guard<std::mutex> slk(session_mutex_);
-  if (!session_.has_value()) {
+  const auto session = configSnapshot()->active_session;
+  if (!session) {
     return {{"ok", false}, {"message", "Zenoh session not open"}};
   }
   try {
@@ -2081,14 +2372,14 @@ nlohmann::json ZenohBridgeNode::handleZenohDeleteApi(const nlohmann::json &body)
                            ? Z_RELIABILITY_BEST_EFFORT
                            : Z_RELIABILITY_RELIABLE;
 #endif
-    session_->delete_resource(zenoh::KeyExpr(key), std::move(opts));
+    session->delete_resource(zenoh::KeyExpr(key), std::move(opts));
     return {{"ok", true}, {"message", "DELETE sent to " + key}};
   } catch (const std::exception &e) {
     return {{"ok", false}, {"message", std::string("DELETE failed: ") + e.what()}};
   }
 }
 
-nlohmann::json ZenohBridgeNode::handleZenohGetApi(const nlohmann::json &body) {
+nlohmann::json ZenohBridgeNode::handleZenohGetApi(const nlohmann::json &body, uint64_t timeout_ms) {
   const std::string key = trimSlashes(body.value("key_expr", ""));
   if (key.empty()) {
     return {{"ok", false}, {"message", "key_expr is required"}};
@@ -2097,10 +2388,10 @@ nlohmann::json ZenohBridgeNode::handleZenohGetApi(const nlohmann::json &body) {
   const std::string payload = body.value("payload", "");
   const std::string target_str = body.value("target", "best_matching");
   const std::string consolidation_str = body.value("consolidation", "auto");
-  const uint64_t timeout_ms = body.value("timeout_ms", uint64_t{3000});
 
-  std::lock_guard<std::mutex> slk(session_mutex_);
-  if (!session_.has_value()) {
+  // A local queryable can run inside get() and take session_mutex_ itself.
+  auto session = configSnapshot()->active_session;
+  if (!session) {
     return {{"ok", false}, {"message", "Zenoh session not open"}};
   }
   try {
@@ -2126,26 +2417,27 @@ nlohmann::json ZenohBridgeNode::handleZenohGetApi(const nlohmann::json &body) {
       opts.payload = zenoh::Bytes(payload);
     }
 
-    auto replies = session_->get(zenoh::KeyExpr(key), parameters,
-                                 zenoh::channels::FifoChannel(128), std::move(opts));
+    auto replies = std::make_shared<HttpReplies>();
+    session->get(zenoh::KeyExpr(key), parameters, replies->onReply(), replies->onDone(), std::move(opts));
+    session.reset();  // Do not pin the session while waiting for replies.
     nlohmann::json out = nlohmann::json::array();
-    for (auto res = replies.recv(); std::holds_alternative<zenoh::Reply>(res); res = replies.recv()) {
-      const auto &rep = std::get<zenoh::Reply>(res);
+    while (auto reply = replies->next(http_server_)) {
+      const auto &rep = *reply;
       if (rep.is_ok()) {
         const auto &sample = rep.get_ok();
-        const auto raw = sample.get_payload().as_vector();
+        const auto &payload = sample.get_payload();
         out.push_back({
             {"ok", true},
             {"key_expr", std::string(sample.get_keyexpr().as_string_view())},
             {"encoding", sample.get_encoding().as_string()},
-            {"bytes", raw.size()},
-            {"payload", formatPreview(raw, 65536)},
+            {"bytes", payload.size()},
+            {"payload", formatPreview(payload, 65536)},
         });
       } else {
         const auto &err = rep.get_err();
         out.push_back({
             {"ok", false},
-            {"error", err.get_payload().as_string()},
+            {"error", formatPreview(err.get_payload(), 65536)},
         });
       }
     }
@@ -2156,10 +2448,11 @@ nlohmann::json ZenohBridgeNode::handleZenohGetApi(const nlohmann::json &body) {
 }
 
 nlohmann::json ZenohBridgeNode::handleZenohScoutApi(const nlohmann::json &body) {
+  const auto config = configSnapshot();
   const size_t timeout_ms = std::max<size_t>(200, std::min<size_t>(10000, body.value("timeout_ms", size_t{1500})));
   const std::string what_str = body.value("what", "router_peer");
-  const std::string mcast_addr = body.value("multicast_address", session_cfg_.multicast_address);
-  const std::string mcast_iface = body.value("multicast_interface", session_cfg_.multicast_interface);
+  const std::string mcast_addr = body.value("multicast_address", config->session.multicast_address);
+  const std::string mcast_iface = body.value("multicast_interface", config->session.multicast_interface);
 
   try {
     auto cfg = zenoh::Config::create_default();
@@ -2205,25 +2498,30 @@ nlohmann::json ZenohBridgeNode::handleZenohScoutApi(const nlohmann::json &body) 
   }
 }
 
-nlohmann::json ZenohBridgeNode::handleLivelinessGetApi(const nlohmann::json &body) {
-  const std::string key = trimSlashes(body.value("key_expr", makeLivelinessWildcard(domain_prefix_)));
+nlohmann::json ZenohBridgeNode::handleLivelinessGetApi(const nlohmann::json &body, uint64_t timeout_ms) {
+  std::shared_ptr<zenoh::Session> session;
+  std::string default_key;
+  {
+    const auto config = configSnapshot();
+    session = config->active_session;
+    default_key = makeLivelinessWildcard(config->bridge.domain_prefix);
+  }
+  const std::string key = trimSlashes(body.value("key_expr", default_key));
   if (key.empty()) {
     return {{"ok", false}, {"message", "key_expr is required"}};
   }
-  const uint64_t timeout_ms = body.value("timeout_ms", uint64_t{2000});
-
-  std::lock_guard<std::mutex> slk(session_mutex_);
-  if (!session_.has_value()) {
+  if (!session) {
     return {{"ok", false}, {"message", "Zenoh session not open"}};
   }
   try {
     auto opts = zenoh::Session::LivelinessGetOptions::create_default();
     opts.timeout_ms = timeout_ms;
-    auto replies = session_->liveliness_get(zenoh::KeyExpr(key),
-                                            zenoh::channels::FifoChannel(128), std::move(opts));
+    auto replies = std::make_shared<HttpReplies>();
+    session->liveliness_get(zenoh::KeyExpr(key), replies->onReply(), replies->onDone(), std::move(opts));
+    session.reset();
     nlohmann::json tokens = nlohmann::json::array();
-    for (auto res = replies.recv(); std::holds_alternative<zenoh::Reply>(res); res = replies.recv()) {
-      const auto &rep = std::get<zenoh::Reply>(res);
+    while (auto reply = replies->next(http_server_)) {
+      const auto &rep = *reply;
       if (rep.is_ok()) {
         tokens.push_back(std::string(rep.get_ok().get_keyexpr().as_string_view()));
       }
@@ -2246,12 +2544,13 @@ nlohmann::json ZenohBridgeNode::handleLivelinessDeclareApi(const nlohmann::json 
     }
   }
   std::lock_guard<std::mutex> slk(session_mutex_);
-  if (!session_.has_value()) {
+  const auto session = configSnapshot()->active_session;
+  if (!session) {
     return {{"ok", false}, {"message", "Zenoh session not open"}};
   }
   try {
     // Declare OUTSIDE liveliness_mutex_ because local liveliness_sub_ callback may fire synchronously!
-    auto token = session_->liveliness_declare_token(zenoh::KeyExpr(key));
+    auto token = session->liveliness_declare_token(zenoh::KeyExpr(key));
     {
       std::lock_guard<std::mutex> llk(liveliness_mutex_);
       custom_liveliness_tokens_.emplace(key, std::move(token));
@@ -2285,7 +2584,7 @@ nlohmann::json ZenohBridgeNode::handleLivelinessUndeclareApi(const nlohmann::jso
 }
 
 nlohmann::json ZenohBridgeNode::handleSniffStartApi(const nlohmann::json &body) {
-  const std::string key = trimSlashes(body.value("key_expr", domain_prefix_ + "/**"));
+  const std::string key = trimSlashes(body.value("key_expr", configSnapshot()->bridge.domain_prefix + "/**"));
   if (key.empty()) {
     return {{"ok", false}, {"message", "key_expr is required"}};
   }
@@ -2293,7 +2592,8 @@ nlohmann::json ZenohBridgeNode::handleSniffStartApi(const nlohmann::json &body) 
   handleSniffStopApi();
 
   std::lock_guard<std::mutex> slk(session_mutex_);
-  if (!session_.has_value()) {
+  const auto session = configSnapshot()->active_session;
+  if (!session) {
     return {{"ok", false}, {"message", "Zenoh session not open"}};
   }
 
@@ -2304,7 +2604,7 @@ nlohmann::json ZenohBridgeNode::handleSniffStartApi(const nlohmann::json &body) 
     sniff_total_count_ = 0;
     sniff_active_.store(true, std::memory_order_release);
 
-    sniff_sub_.emplace(session_->declare_subscriber(
+    sniff_sub_.emplace(session->declare_subscriber(
         zenoh::KeyExpr(key),
         [this](const zenoh::Sample &sample) {
           if (!sniff_active_.load(std::memory_order_acquire)) return;
@@ -2312,12 +2612,12 @@ nlohmann::json ZenohBridgeNode::handleSniffStartApi(const nlohmann::json &body) 
           ss.timestamp_ms = nowEpochMs();
           ss.key_expr = std::string(sample.get_keyexpr().as_string_view());
           ss.encoding = sample.get_encoding().as_string();
-          const auto raw = sample.get_payload().as_vector();
-          ss.payload_bytes = raw.size();
-          ss.payload_preview = formatPreview(raw, 200);
+          const auto &payload = sample.get_payload();
+          ss.payload_bytes = payload.size();
+          ss.payload_preview = formatPreview(payload, 200);
           ss.kind = (sample.get_kind() == Z_SAMPLE_KIND_DELETE) ? "DELETE" : "PUT";
           if (auto att = sample.get_attachment()) {
-            ss.attachment = att->get().as_string();
+            ss.attachment = formatPreview(att->get(), 65536);
           }
           std::lock_guard<std::mutex> blk(sniff_mutex_);
           ++sniff_total_count_;
@@ -2344,11 +2644,10 @@ nlohmann::json ZenohBridgeNode::handleSniffStopApi() {
 void ZenohBridgeNode::addLog(const std::string &level, const std::string &message) {
   const int64_t now_ms = nowEpochMs();
   std::lock_guard<std::mutex> lk(log_mutex_);
-  if (message == last_log_msg_ && (now_ms - last_log_ms_) < 4000) {
+  if (!log_buffer_.empty() && message == log_buffer_.front().message &&
+      now_ms - log_buffer_.front().timestamp_ms < 4000) {
     return;
   }
-  last_log_msg_ = message;
-  last_log_ms_ = now_ms;
   if (level == "WARN") ++warn_count_;
   if (level == "ERROR") ++error_count_;
   log_buffer_.push_front(LogEntry{now_ms, level, message});
@@ -2371,8 +2670,6 @@ std::vector<LogEntry> ZenohBridgeNode::getRecentLogs(size_t max_count) const {
 void ZenohBridgeNode::clearLogs() {
   std::lock_guard<std::mutex> lk(log_mutex_);
   log_buffer_.clear();
-  last_log_msg_.clear();
-  last_log_ms_ = 0;
   warn_count_ = 0;
   error_count_ = 0;
 }
@@ -2490,30 +2787,65 @@ int64_t ZenohBridgeNode::nowEpochMs() {
       .count();
 }
 
-std::string ZenohBridgeNode::formatPreview(const std::vector<uint8_t> &bytes, size_t max_len) {
-  if (bytes.empty()) return "";
-  size_t printable = 0;
-  const size_t check_n = std::min<size_t>(bytes.size(), 64);
-  for (size_t i = 0; i < check_n; ++i) {
-    const uint8_t c = bytes[i];
-    if ((c >= 32 && c <= 126) || c == '\n' || c == '\r' || c == '\t') {
-      ++printable;
-    }
+namespace {
+// Length of one printable UTF-8 scalar, or zero for binary/malformed input.
+size_t textCharLength(const uint8_t *p, size_t remaining) {
+  const uint8_t c = p[0];
+  if (c < 0x80) return (c >= 0x20 && c != 0x7f) || c == '\t' || c == '\n' || c == '\r';
+  if (c < 0xc2 || c > 0xf4) return 0;
+  const size_t n = c < 0xe0 ? 2 : (c < 0xf0 ? 3 : 4);
+  if (n > remaining) return 0;
+  for (size_t i = 1; i < n; ++i) {
+    if ((p[i] & 0xc0) != 0x80) return 0;
   }
-  if (printable * 100 >= check_n * 85) {
-    const size_t n = std::min(bytes.size(), max_len);
-    std::string s(reinterpret_cast<const char *>(bytes.data()), n);
-    if (bytes.size() > max_len) s += "...";
+  // Exclude overlong sequences, UTF-16 surrogates, and values above U+10FFFF.
+  if ((c == 0xe0 && p[1] < 0xa0) || (c == 0xed && p[1] >= 0xa0) ||
+      (c == 0xf0 && p[1] < 0x90) || (c == 0xf4 && p[1] >= 0x90)) return 0;
+  return n;
+}
+}  // namespace
+
+std::string ZenohBridgeNode::formatPreview(const zenoh::Bytes &payload, size_t max_len) {
+  const size_t size = payload.size();
+  if (size == 0) return "";
+  const size_t limit = std::min(size, max_len);
+  // Peek up to three extra bytes to distinguish a split character from malformed input.
+  const size_t inspect = limit + std::min<size_t>(3, size - limit);
+  // Most binary samples are identifiable in the first chunk. Read the rest
+  // only if the prefix is still text, without splitting a UTF-8 scalar.
+  const size_t wanted = std::min(size, std::max<size_t>(24, inspect));
+  auto reader = payload.reader();
+  std::vector<uint8_t> bytes(std::min<size_t>(wanted, 256));
+  const size_t prefix_size = bytes.size();
+  bytes.resize(reader.read(bytes.data(), prefix_size));
+  bool text = bytes.size() == prefix_size;
+  size_t end = 0;
+  while (text && end < limit) {
+    if (bytes.size() < inspect && bytes.size() - end < 4) {
+      const size_t prefix = bytes.size();
+      bytes.resize(wanted);
+      bytes.resize(prefix + reader.read(bytes.data() + prefix, wanted - prefix));
+      text = bytes.size() == wanted;
+      if (!text) break;
+    }
+    const size_t width = textCharLength(bytes.data() + end, bytes.size() - end);
+    if (width == 0) text = false;
+    else if (width > limit - end) break;
+    else end += width;
+  }
+  if (text) {
+    std::string s(bytes.begin(), bytes.begin() + end);
+    if (end < size) s += "...";
     return s;
   }
   std::ostringstream oss;
-  oss << "<binary " << bytes.size() << "B: ";
+  oss << "<binary " << size << "B: ";
   const size_t n = std::min<size_t>(bytes.size(), 24);
   for (size_t i = 0; i < n; ++i) {
     oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(bytes[i]);
     if (i + 1 < n) oss << ' ';
   }
-  if (bytes.size() > n) oss << " ...";
+  if (size > n) oss << " ...";
   oss << ">";
   return oss.str();
 }

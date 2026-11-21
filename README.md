@@ -17,6 +17,17 @@ Official **Eclipse Zenoh 1.8 C++** dynamic ROS 2 bridge packaged as an AivudaOS 
   - Real-time **Transports & Active Links** inspector (`get_transports()` / `get_links()` + connect/disconnect event logs).
   - **Active Scouting** (`zenoh::scout()`), **Liveliness** token monitor & custom token declare/undeclare, **PUT / DELETE / GET**, **AdminSpace (`@/**`)** quick queries, and **Live Key Sniffer**.
 
+## DDS Shield: scope and administration
+
+The shield is **off by default**. It filters host input/output on non-loopback interfaces using an `inet` nftables table, for both IPv4 and IPv6. `domain` filters the standard UDP destination-port ranges for the selected ROS domains; `all` additionally filters standard RTPS multicast discovery/data ports across domains. Domain IDs must be decimal 0–232, separated by commas; an empty setting uses the node's `ROS_DOMAIN_ID` (0 if unset). Invalid input is rejected, not replaced with domain 0.
+
+This is **port filtering, not a DDS protocol firewall**. It may block other applications using the same UDP ports. Loopback and default Zenoh scouting to `224.0.0.224:7446/udp` are exempt; other traffic is not exempt merely because it uses port 7446 or 7447. Custom transports, nonstandard ports and forwarded packets are outside its scope. Configure non-conflicting Zenoh endpoints if needed.
+
+- **Administration:** set a high-entropy `ZENOH_BRIDGE_SHIELD_TOKEN` in the bridge service environment, not in the browser bundle or a runtime JSON file. In the target node's own UI, open **路由与流控**, enter the token, and apply the policy over HTTPS (or loopback). The UI does not save the token. Both HTTP write paths require the `X-DDS-Shield-Token` header to change policy; leaving the environment variable unset disables HTTP policy changes. Zenoh peers can read status but cannot change the firewall, even through bridge settings. Secure the rest of the management API separately.
+- **Privileges:** enabling the shield requires Linux nftables with JSON transactions, `inet` hooks and table handles, plus permission to administer the target network namespace. Run only a trusted service/install; do not grant general firewall privileges to an untrusted user. A persisted enabled policy must install before ROS initializes or the node will not start.
+- **Lifecycle:** each installation manages a table derived from its absolute bridge settings file path. Keep this path stable. Stopping the process does not remove its filters; to remove them, explicitly disable the shield on the owning installation **before moving its data directory or uninstalling it**. Status only covers that installation's table, not other filters in the namespace. Saving bridge settings syncs both the replacement file and its parent directory before reporting success. If a directory sync fails, the new file may already be visible; inspect the settings and retry the save rather than assuming it survived a reboot.
+- **Upgrading:** old `ZENOH_DDS_SHIELD_IN`/`ZENOH_DDS_SHIELD_OUT` iptables chains have no reliable owner. The new helper neither adopts nor deletes them. Have the host administrator review and retire legacy rules separately, after verifying the replacement on the target system.
+
 ## Directory Structure
 
 ```text
@@ -40,6 +51,24 @@ Requires ROS 2 (e.g. Jazzy / Lyrical / Kilted / Humble) with `zenoh_cpp_vendor`,
 ```bash
 # Build native C++ binary
 ./scripts/pre_install.sh
+
+# With ROS 2 sourced in this shell, test the local HTTP and Zenoh paths.
+# Starts a temporary node on loopback with discovery disabled.
+python3 tests/bridge_smoke.py build/zenoh_bridge_node
+
+# Shield regressions: these use mock nft/helper implementations, not the host firewall.
+python3 tests/test_dds_shield.py
+python3 tests/test_config_schema.py
+node --test tests/shield_ui.cjs
+python3 tests/dds_shield_startup.py build/zenoh_bridge_node
+python3 tests/shield_api.py build/zenoh_bridge_node
+
+# Linux: verify durable file replacement, including simulated fsync errors.
+c++ -std=c++17 -Isrc/include tests/atomic_write.cpp -Wl,--wrap=fsync -o build/test-atomic
+build/test-atomic
+
+# Optional rolling-upgrade test using a separately built, original v2.1 binary.
+python3 tests/mixed_version.py build/zenoh_bridge_node /path/to/v2.1/zenoh_bridge_node
 
 # Validate config schema and create AivudaOS .tar.gz archive in dist/
 ./pack.sh
