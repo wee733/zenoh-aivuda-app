@@ -1,0 +1,72 @@
+type: object
+properties:
+  sys:
+    type: object
+    properties:
+      robot_type:
+        type: string
+        minLength: 1
+        default: fastlio2_rotor
+        description: "Robot or node type (e.g. fastlio2_rotor, mocap_rotor, gps_rotor, ground_station)."
+        need_restart: true
+      role:
+        type: object
+        properties:
+          id:
+            type: integer
+            minimum: 0
+            default: 1
+            description: "Numeric role ID (magnet-synced). Used as default agent_id uav<id> unless overridden in Zenoh Bridge Web UI."
+            need_restart: true
+        required:
+          - id
+        additionalProperties: false
+    required:
+      - robot_type
+      - role
+    additionalProperties: false
+  ros:
+    type: object
+    properties:
+      distro:
+        type: string
+        enum:
+          - auto
+          - jazzy
+          - lyrical
+          - humble
+          - kilted
+        default: auto
+        description: "ROS 2 distribution to source before launching zenoh_bridge_node (auto detects /opt/ros/*)."
+        need_restart: true
+      setup_script:
+        type: string
+        default: ""
+        description: "Optional ROS 2 setup.bash override (empty uses /opt/ros/<distro>/setup.bash)."
+        need_restart: true
+      discovery_range:
+        type: string
+        enum:
+          - LOCALHOST
+          - SUBNET
+          - SYSTEM_DEFAULT
+        default: LOCALHOST
+        description: "ROS 2 DDS discovery range (LOCALHOST isolates DDS on-device and routes inter-node traffic over Zenoh)."
+        need_restart: true
+      domain_id:
+        type: integer
+        minimum: -1
+        maximum: 232
+        default: -1
+        description: "ROS_DOMAIN_ID (-1 inherits host environment default)."
+        need_restart: true
+    required:
+      - distro
+      - setup_script
+      - discovery_range
+      - domain_id
+    additionalProperties: false
+required:
+  - sys
+  - ros
+additionalProperties: false

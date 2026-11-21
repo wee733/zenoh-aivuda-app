@@ -1,0 +1,944 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Zenoh Bridge · ACEswarm</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Header -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-logo">Z</div>
+        <div>
+          <div class="brand-title">Zenoh Bridge <span class="badge badge-info">v2.1</span></div>
+          <div class="brand-sub" id="localSummary">Connecting to local Zenoh engine...</div>
+        </div>
+      </div>
+
+      <div class="topbar-metrics">
+        <div class="metric-pill">
+          <span class="metric-label">TX</span>
+          <span class="metric-val" id="metricTx">0.0 KB/s</span>
+        </div>
+        <div class="metric-pill">
+          <span class="metric-label">RX</span>
+          <span class="metric-val" id="metricRx">0.0 KB/s</span>
+        </div>
+        <div class="metric-pill">
+          <span class="metric-label">Peers</span>
+          <span class="metric-val" id="metricPeers">0</span>
+        </div>
+        <div class="conn-dot" id="apiStatusDot" title="API Status"></div>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <!-- Left Sidebar: Swarm Fleet -->
+      <aside class="sidebar">
+        <div class="sidebar-header">
+          <span>集群节点 (Swarm Fleet)</span>
+          <button class="btn btn-xs btn-ghost" id="btnRefreshFleet" title="刷新节点">刷新</button>
+        </div>
+        <div class="fleet-list" id="fleetList">
+          <div class="empty-hint">正在发现 Zenoh 节点...</div>
+        </div>
+
+        <div class="sidebar-section">
+          <div class="sidebar-section-title">一键预设 (Presets)</div>
+          <select id="presetSelect" class="input-select full-width">
+            <option value="formation">Formation (通用编队)</option>
+            <option value="uxrce_swarm">uXRCE Swarm (PX4 DDS)</option>
+            <option value="vision_debug">Vision &amp; LiDAR Debug</option>
+            <option value="low_bandwidth">Low Bandwidth (低带宽)</option>
+            <option value="empty">Empty (清空规则)</option>
+          </select>
+          <div class="btn-row mt-8">
+            <button class="btn btn-sm btn-secondary flex-1" id="btnApplyPresetOne">应用当前节点</button>
+            <button class="btn btn-sm btn-primary flex-1" id="btnApplyPresetAll">推送全部在线</button>
+          </div>
+          <label class="check-inline mt-6">
+            <input type="checkbox" id="chkPresetSave" checked />
+            <span>同时持久化到 routes.yaml</span>
+          </label>
+        </div>
+      </aside>
+
+      <!-- Main Panel -->
+      <main class="main-content">
+        <div class="agent-banner">
+          <div class="agent-banner-left">
+            <h2 id="selectedAgentTitle">--</h2>
+            <span class="badge" id="selectedAgentMode">--</span>
+            <span class="badge badge-muted" id="selectedAgentDistro">--</span>
+            <span class="mono small muted" id="selectedAgentZid"></span>
+          </div>
+          <div class="tabs" id="mainTabs">
+            <button class="tab active" data-tab="routes">路由与流控</button>
+            <button class="tab" data-tab="discovery">话题发现 <span class="tab-count" id="topicCountBadge">0</span></button>
+            <button class="tab" data-tab="logs">运行日志 <span class="tab-count hidden" id="logAlertBadge">0</span></button>
+            <button class="tab" data-tab="session">Zenoh 内核配置</button>
+            <button class="tab" data-tab="lab">Zenoh 实验室</button>
+          </div>
+        </div>
+
+        <!-- TAB 1: ROUTES & QOS -->
+        <section class="tab-panel active" id="tab-routes">
+          <div class="action-bar">
+            <div class="action-bar-left">
+              <span class="dirty-badge hidden" id="dirtyBadge">有未提交修改</span>
+              <span class="muted small" id="routesHint">修改后点击「热更新」立即生效，无需重启节点</span>
+            </div>
+            <div class="action-bar-right">
+              <button class="btn btn-sm btn-ghost" id="btnReloadRules">放弃修改</button>
+              <button class="btn btn-sm btn-ghost" id="btnExportRules">导出 JSON</button>
+              <button class="btn btn-sm btn-ghost" id="btnImportRules">导入 JSON</button>
+              <input type="file" id="importFileInput" accept=".json" class="hidden" />
+              <button class="btn btn-sm btn-secondary" id="btnApplyLive">热更新 (Apply Live)</button>
+              <button class="btn btn-sm btn-primary" id="btnApplySave">热更新并保存 (Save)</button>
+            </div>
+          </div>
+
+          <!-- Egress Card -->
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3>出站规则 Egress (本机 ROS 2 &rarr; Zenoh)</h3>
+                <p class="muted small">支持零转码 CDR 透传、频率/带宽限流、On-Demand 按需零空耗、7 级 Zenoh 优先级、Express 与 Locality 范围控制</p>
+              </div>
+              <button class="btn btn-sm btn-primary" id="btnAddEgress">+ 添加出站规则</button>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table" id="egressTable">
+                <thead>
+                  <tr>
+                    <th style="width:40px">启用</th>
+                    <th style="min-width:185px">ROS 2 话题 (Topic)</th>
+                    <th style="min-width:120px">自定义 Key (可选)</th>
+                    <th style="width:70px" title="0 表示不限频">最大 Hz</th>
+                    <th style="width:74px" title="0 表示不限带宽">限速 KB/s</th>
+                    <th style="width:52px" title="使用 Zenoh MatchingListener，无远端订阅者时 0 流量">按需</th>
+                    <th style="width:120px">Zenoh 优先级</th>
+                    <th style="width:92px">拥塞策略</th>
+                    <th style="width:54px" title="绕过批处理，最低延迟">Express</th>
+                    <th style="width:98px">Zenoh 可靠性</th>
+                    <th style="width:98px" title="Zenoh allowed_destination">Locality</th>
+                    <th style="width:112px">ROS 2 QoS</th>
+                    <th style="width:58px">Depth</th>
+                    <th style="min-width:135px">实时状态</th>
+                    <th style="width:40px"></th>
+                  </tr>
+                </thead>
+                <tbody id="egressTbody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Ingress Card -->
+          <div class="card mt-14">
+            <div class="card-header">
+              <div>
+                <h3>入站规则 Ingress (Zenoh &rarr; 本机 ROS 2)</h3>
+                <p class="muted small">支持 Zenoh 通配符（如 <code>*/fmu/out/vehicle_odometry</code>、<code>uav2/**</code>）、Locality 来源过滤、自动防回环与前缀重映射</p>
+              </div>
+              <button class="btn btn-sm btn-primary" id="btnAddIngress">+ 添加入站规则</button>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table" id="ingressTable">
+                <thead>
+                  <tr>
+                    <th style="width:40px">启用</th>
+                    <th style="min-width:210px">Zenoh 订阅 Pattern</th>
+                    <th style="min-width:125px">本地重映射前缀 (可选)</th>
+                    <th style="width:68px">排除自身</th>
+                    <th style="width:76px">最大 Hz</th>
+                    <th style="width:102px" title="Zenoh allowed_origin">Locality</th>
+                    <th style="width:112px">ROS 2 QoS</th>
+                    <th style="width:62px">Depth</th>
+                    <th style="min-width:190px">实时状态 / 已生成本地话题</th>
+                    <th style="width:40px"></th>
+                  </tr>
+                </thead>
+                <tbody id="ingressTbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 2: TOPIC DISCOVERY -->
+        <section class="tab-panel" id="tab-discovery">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3>在线 ROS 2 话题发现 (<span id="discAgentName">--</span>)</h3>
+                <p class="muted small">点击「+ 桥接到 Zenoh」自动按消息类型填入推荐的频率、QoS、优先级和 On-Demand 配置</p>
+              </div>
+              <div class="btn-row">
+                <input type="text" id="topicSearchInput" class="input-text" placeholder="搜索话题或消息类型..." style="width:240px" />
+                <button class="btn btn-sm btn-secondary" id="btnScanTopics">立即扫描</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>话题名 (Topic)</th>
+                    <th>消息类型 (Type)</th>
+                    <th style="width:80px">Pub / Sub</th>
+                    <th style="width:150px">发布者 QoS</th>
+                    <th style="width:130px">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="discoveryTbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 2.5: LIVE LOGS -->
+        <section class="tab-panel" id="tab-logs">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3>节点实时运行日志 (<span id="logsAgentName">--</span>)</h3>
+                <p class="muted small">自动聚合话题绑定、Transport/Link 上下线事件、Liveliness 在线变更、配置校验与发布异常</p>
+              </div>
+              <div class="btn-row">
+                <select id="logLevelFilter" class="input-select">
+                  <option value="ALL">全部级别 (ALL)</option>
+                  <option value="WARN">仅警告与错误 (WARN / ERROR)</option>
+                  <option value="ERROR">仅错误 (ERROR)</option>
+                </select>
+                <button class="btn btn-sm btn-secondary" id="btnRefreshLogs">刷新日志</button>
+                <button class="btn btn-sm btn-danger" id="btnClearLogs">清空日志</button>
+              </div>
+            </div>
+            <div class="table-wrap" style="max-height:540px;overflow-y:auto">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th style="width:96px">时间</th>
+                    <th style="width:76px">级别</th>
+                    <th>日志内容</th>
+                  </tr>
+                </thead>
+                <tbody id="logsTbody">
+                  <tr><td colspan="3" class="empty-hint">暂无日志</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 3: ZENOH KERNEL & BRIDGE CONFIG -->
+        <section class="tab-panel" id="tab-session">
+          <div class="target-banner">
+            <div>
+              <strong>当前配置目标：<span id="sessTargetAgent">--</span></strong>
+              <span class="muted small" style="margin-left:8px">点击左侧集群节点可直接查看或远程热修改该节点的桥接身份与 Zenoh 1.8 内核配置</span>
+            </div>
+            <button class="btn btn-sm btn-ghost" id="btnRefreshInfo">刷新内核与链路状态</button>
+          </div>
+
+          <!-- Bridge Identity & Runtime Settings (migrated from AivudaOS Config Panel) -->
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h3>桥接身份与基础设置（已从 AivudaOS Config 面板全部迁入此页）</h3>
+                <p class="muted small">持久化到 <code>runtime/bridge_settings.json</code>，支持本机及远端热更新；AivudaOS Config 面板仅保留 <code>sys</code> 与 <code>ros</code></p>
+              </div>
+              <button class="btn btn-sm btn-primary" id="btnSaveBridgeSettings">应用并保存桥接设置</button>
+            </div>
+            <div class="form-grid">
+              <label class="field">
+                <span>Agent ID（留空自动使用 <code>sys.role.id</code>，默认 <code id="bsDefaultAgentHint">uav1</code>）</span>
+                <input type="text" id="bsAgentId" class="input-text mono" placeholder="留空自动推导 uav<id>，或填 gcs / uav2" />
+              </label>
+              <label class="field">
+                <span>Domain Prefix（集群共享 Key 前缀）</span>
+                <input type="text" id="bsDomainPrefix" class="input-text mono" placeholder="swarm" />
+              </label>
+              <label class="field">
+                <span>首次启动默认预设 (Default Preset)</span>
+                <select id="bsDefaultPreset" class="input-select">
+                  <option value="empty">empty (空规则)</option>
+                  <option value="formation">formation (通用编队)</option>
+                  <option value="uxrce_swarm">uxrce_swarm (PX4 DDS)</option>
+                  <option value="vision_debug">vision_debug (视觉与雷达)</option>
+                  <option value="low_bandwidth">low_bandwidth (低带宽)</option>
+                </select>
+              </label>
+              <div class="field">
+                <span>运行开关</span>
+                <div class="toggle-grid">
+                  <label class="check-card"><input type="checkbox" id="bsAllowUnprefixed" /><span>匹配无前缀本地话题</span></label>
+                  <label class="check-card"><input type="checkbox" id="bsLiveliness" /><span>启用官方 Liveliness 令牌</span></label>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid-2 mt-14">
+            <!-- Left Column: Full Zenoh 1.8.0 Config (Visual + Raw JSON5) -->
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <h3>官方 Zenoh 1.8.0 内核配置</h3>
+                  <p class="muted small">支持完整可视化分组配置与真 JSON5（注释/尾逗号/无引号 key）双模式</p>
+                </div>
+                <div class="btn-row">
+                  <div class="mode-switch">
+                    <button class="mode-btn active" id="btnModeStructured">可视化分组</button>
+                    <button class="mode-btn" id="btnModeRawJson5">原生完整 JSON5</button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="btn-row" style="margin-bottom:12px;justify-content:flex-end;flex-wrap:wrap">
+                <button class="btn btn-sm btn-ghost" id="btnValidateConfig">校验配置 (Dry-Run)</button>
+                <button class="btn btn-sm btn-primary" id="btnReconnectSession">应用并热重连 Session</button>
+              </div>
+
+              <!-- STRUCTURED VISUAL MODE -->
+              <div id="cfgModeStructured">
+                <!-- Group 1: Basic Mode, Identity & Endpoints -->
+                <details class="cfg-group" open>
+                  <summary>1. 基础模式、身份与端点 (Mode / ID / Namespace / Connect / Listen)</summary>
+                  <div class="cfg-group-body">
+                    <div class="form-grid">
+                      <label class="field">
+                        <span>运行模式 (mode)</span>
+                        <select id="sessMode" class="input-select">
+                          <option value="peer">peer (局域网 P2P 自动组网)</option>
+                          <option value="client">client (连接中心 Router)</option>
+                          <option value="router">router (路由中继节点)</option>
+                        </select>
+                      </label>
+                      <label class="field">
+                        <span>自定义 ZID (id，留空自动生成 16 字节 Hex)</span>
+                        <input type="text" id="sessCustomZid" class="input-text mono" placeholder="留空自动生成" />
+                      </label>
+                      <label class="field">
+                        <span>Zenoh 命名空间 (namespace，自动加在所有 Key 前)</span>
+                        <input type="text" id="sessNamespace" class="input-text mono" placeholder="留空无命名空间，如 robot/zone1" />
+                      </label>
+                      <label class="field">
+                        <span>默认查询超时 (queries_default_timeout ms)</span>
+                        <input type="number" id="sessQueriesTimeout" class="input-num full-width" min="100" step="500" />
+                      </label>
+                      <label class="field span-2">
+                        <span>Connect Endpoints（每行一个，支持 <code>tcp/</code> <code>udp/</code> <code>quic/</code> <code>tls/</code> <code>ws/</code> <code>unixsock-stream/</code>）</span>
+                        <textarea id="sessConnect" class="input-textarea mono" rows="2" placeholder="tcp/192.168.20.20:7447"></textarea>
+                      </label>
+                      <label class="field">
+                        <span>Connect 超时 (connect.timeout_ms，0=默认)</span>
+                        <input type="number" id="sessConnectTimeout" class="input-num full-width" min="0" step="500" />
+                      </label>
+                      <label class="field">
+                        <span>Connect 失败退出</span>
+                        <label class="check-card"><input type="checkbox" id="sessConnectExitFail" /><span>connect.exit_on_failure</span></label>
+                      </label>
+                      <label class="field span-2">
+                        <span>Listen Endpoints（每行一个，如 <code>tcp/[::]:0</code>、<code>tcp/0.0.0.0:7447</code>、<code>quic/0.0.0.0:7447</code>）</span>
+                        <textarea id="sessListen" class="input-textarea mono" rows="2" placeholder="tcp/[::]:0"></textarea>
+                      </label>
+                      <label class="field">
+                        <span>Listen 超时 (listen.timeout_ms，0=默认)</span>
+                        <input type="number" id="sessListenTimeout" class="input-num full-width" min="0" step="500" />
+                      </label>
+                      <label class="field">
+                        <span>Listen 失败退出</span>
+                        <label class="check-card"><input type="checkbox" id="sessListenExitFail" /><span>listen.exit_on_failure</span></label>
+                      </label>
+                      <label class="field span-2">
+                        <span>节点元数据 (metadata JSON5 对象，可选)</span>
+                        <input type="text" id="sessMetadataJson5" class="input-text mono" placeholder='{ name: "uav1", location: "lab" }' />
+                      </label>
+                    </div>
+                  </div>
+                </details>
+
+                <!-- Group 2: Scouting -->
+                <details class="cfg-group">
+                  <summary>2. 节点发现 Scouting (Multicast &amp; Gossip)</summary>
+                  <div class="cfg-group-body">
+                    <div class="form-grid">
+                      <label class="field">
+                        <span>Scouting 超时 (scouting.timeout ms)</span>
+                        <input type="number" id="sessScoutTimeout" class="input-num full-width" min="100" step="100" />
+                      </label>
+                      <label class="field">
+                        <span>Scouting 延迟 (scouting.delay ms)</span>
+                        <input type="number" id="sessScoutDelay" class="input-num full-width" min="0" step="100" />
+                      </label>
+                      <label class="field">
+                        <span>Multicast 地址</span>
+                        <input type="text" id="sessMcastAddr" class="input-text mono" placeholder="224.0.0.224:7446" />
+                      </label>
+                      <label class="field">
+                        <span>Multicast 网卡 (interface)</span>
+                        <input type="text" id="sessMcastIface" class="input-text mono" placeholder="auto 或 enp129s0" />
+                      </label>
+                      <label class="field">
+                        <span>Multicast TTL</span>
+                        <input type="number" id="sessMcastTtl" class="input-num full-width" min="1" max="255" />
+                      </label>
+                      <div class="field">
+                        <span>发现选项</span>
+                        <div class="toggle-grid">
+                          <label class="check-card"><input type="checkbox" id="sessMcastEn" /><span>Multicast 启用</span></label>
+                          <label class="check-card"><input type="checkbox" id="sessMcastListen" /><span>Multicast 监听</span></label>
+                          <label class="check-card"><input type="checkbox" id="sessGossipEn" /><span>Gossip 启用</span></label>
+                          <label class="check-card"><input type="checkbox" id="sessGossipMulti" /><span>Gossip Multihop</span></label>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </details>
+
+                <!-- Group 3: Transport, MultiLink, TX/RX Queue & TCP -->
+                <details class="cfg-group">
+                  <summary>3. 传输、多链路、队列与 TCP 调优 (Transport / MultiLink / TX-RX / TCP)</summary>
+                  <div class="cfg-group-body">
+                    <div class="toggle-grid" style="margin-bottom:10px">
+                      <label class="check-card"><input type="checkbox" id="sessLowLatency" /><span>Unicast LowLatency</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessUnicastQos" /><span>Unicast QoS</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessCompression" /><span>Unicast Compression</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessBatching" /><span>TX Batching</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessMcastQos" /><span>Multicast QoS</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessMcastComp" /><span>Multicast Compression</span></label>
+                    </div>
+                    <div class="form-grid">
+                      <label class="field">
+                        <span>最大会话数 (unicast.max_sessions)</span>
+                        <input type="number" id="sessMaxSessions" class="input-num full-width" min="1" />
+                      </label>
+                      <label class="field">
+                        <span>单会话最大链路数 (max_links 多链路聚合)</span>
+                        <input type="number" id="sessMaxLinks" class="input-num full-width" min="1" max="16" />
+                      </label>
+                      <label class="field">
+                        <span>Unicast Open / Accept 超时 (ms)</span>
+                        <div class="btn-row">
+                          <input type="number" id="sessOpenTimeout" class="input-num flex-1" min="500" title="open_timeout" />
+                          <input type="number" id="sessAcceptTimeout" class="input-num flex-1" min="500" title="accept_timeout" />
+                        </div>
+                      </label>
+                      <label class="field">
+                        <span>链路租约 Lease (ms) / KeepAlive</span>
+                        <div class="btn-row">
+                          <input type="number" id="sessLeaseMs" class="input-num flex-1" min="1000" step="1000" title="lease_ms" />
+                          <input type="number" id="sessKeepAlive" class="input-num flex-1" min="1" max="20" title="keep_alive" />
+                        </div>
+                      </label>
+                      <label class="field">
+                        <span>TX Batch Size / Batch Time Limit (ms)</span>
+                        <div class="btn-row">
+                          <input type="number" id="sessTxBatchSize" class="input-num flex-1" min="1024" max="65535" title="batch_size" />
+                          <input type="number" id="sessBatchTimeLimit" class="input-num flex-1" min="0" title="time_limit" />
+                        </div>
+                      </label>
+                      <label class="field">
+                        <span>TX Threads (0=默认) / Mcast Join Interval</span>
+                        <div class="btn-row">
+                          <input type="number" id="sessTxThreads" class="input-num flex-1" min="0" max="64" title="tx.threads" />
+                          <input type="number" id="sessMcastJoinInt" class="input-num flex-1" min="100" title="multicast.join_interval" />
+                        </div>
+                      </label>
+                      <label class="field">
+                        <span>RX Buffer Size / Max Message Size (B)</span>
+                        <div class="btn-row">
+                          <input type="number" id="sessRxBufSize" class="input-num flex-1" min="1024" title="rx.buffer_size" />
+                          <input type="number" id="sessRxMaxMsg" class="input-num flex-1" min="65535" title="rx.max_message_size" />
+                        </div>
+                      </label>
+                      <label class="field">
+                        <span>TCP SO_SNDBUF / SO_RCVBUF (0=OS 默认)</span>
+                        <div class="btn-row">
+                          <input type="number" id="sessTcpSndBuf" class="input-num flex-1" min="0" title="so_sndbuf" />
+                          <input type="number" id="sessTcpRcvBuf" class="input-num flex-1" min="0" title="so_rcvbuf" />
+                        </div>
+                      </label>
+                      <label class="field span-2">
+                        <span>TX 队列高级 JSON5 (<code>transport.link.tx.queue</code>，可自定义 8 级队列深度与拥塞超时)</span>
+                        <textarea id="sessTxQueueJson5" class="input-textarea mono" rows="2" placeholder='{ size: { real_time: 4, data_high: 4, data: 2 } }'></textarea>
+                      </label>
+                    </div>
+                  </div>
+                </details>
+
+                <!-- Group 4: Shared Memory (SHM) -->
+                <details class="cfg-group">
+                  <summary>4. 共享内存零拷贝 (Shared Memory / SHM)</summary>
+                  <div class="cfg-group-body">
+                    <div class="toggle-grid" style="margin-bottom:10px">
+                      <label class="check-card"><input type="checkbox" id="sessShm" /><span>启用 SHM</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessShmOpt" /><span>自动传输优化 (transport_optimization)</span></label>
+                    </div>
+                    <div class="form-grid">
+                      <label class="field">
+                        <span>初始化模式 (shared_memory.mode)</span>
+                        <select id="sessShmMode" class="input-select">
+                          <option value="lazy">lazy (按需延迟分配)</option>
+                          <option value="init">init (启动即初始化)</option>
+                        </select>
+                      </label>
+                      <label class="field">
+                        <span>SHM 内存池大小 (pool_size 字节)</span>
+                        <input type="number" id="sessShmPoolSize" class="input-num full-width" min="65536" step="1048576" />
+                      </label>
+                      <label class="field span-2">
+                        <span>SHM 启用阈值 (message_size_threshold 字节，超过此大小自动走 SHM)</span>
+                        <input type="number" id="sessShmThreshold" class="input-num full-width" min="0" step="512" />
+                      </label>
+                    </div>
+                  </div>
+                </details>
+
+                <!-- Group 5: Security (TLS / mTLS / Auth / ACL) -->
+                <details class="cfg-group">
+                  <summary>5. 安全加密、认证与访问控制 (TLS / mTLS / UsrPwd / PubKey / ACL)</summary>
+                  <div class="cfg-group-body">
+                    <div class="form-grid">
+                      <label class="field span-2">
+                        <span>TLS Root CA 证书路径 (<code>transport.link.tls.root_ca_certificate</code>)</span>
+                        <input type="text" id="sessTlsRootCa" class="input-text mono" placeholder="/path/to/ca.pem" />
+                      </label>
+                      <label class="field">
+                        <span>TLS Listen 证书 (listen_certificate)</span>
+                        <input type="text" id="sessTlsListenCert" class="input-text mono" placeholder="/path/to/server.crt" />
+                      </label>
+                      <label class="field">
+                        <span>TLS Listen 私钥 (listen_private_key)</span>
+                        <input type="text" id="sessTlsListenKey" class="input-text mono" placeholder="/path/to/server.key" />
+                      </label>
+                      <label class="field">
+                        <span>mTLS 客户端证书 (connect_certificate)</span>
+                        <input type="text" id="sessTlsConnectCert" class="input-text mono" placeholder="/path/to/client.crt" />
+                      </label>
+                      <label class="field">
+                        <span>mTLS 客户端私钥 (connect_private_key)</span>
+                        <input type="text" id="sessTlsConnectKey" class="input-text mono" placeholder="/path/to/client.key" />
+                      </label>
+                      <div class="toggle-grid span-2">
+                        <label class="check-card"><input type="checkbox" id="sessTlsMtls" /><span>启用双向认证 mTLS</span></label>
+                        <label class="check-card"><input type="checkbox" id="sessTlsVerifyName" /><span>连接时校验主机名 (verify_name)</span></label>
+                      </div>
+                      <label class="field">
+                        <span>账号密码认证 User (usrpwd.user)</span>
+                        <input type="text" id="sessAuthUser" class="input-text mono" placeholder="留空不启用" />
+                      </label>
+                      <label class="field">
+                        <span>账号密码认证 Password</span>
+                        <input type="password" id="sessAuthPass" class="input-text mono" placeholder="留空不启用" />
+                      </label>
+                      <label class="field span-2">
+                        <span>UsrPwd 密码字典文件 (usrpwd.dictionary_file)</span>
+                        <input type="text" id="sessAuthDict" class="input-text mono" placeholder="/path/to/users.txt" />
+                      </label>
+                      <label class="field">
+                        <span>PubKey 公钥文件 (public_key_file)</span>
+                        <input type="text" id="sessAuthPubKey" class="input-text mono" placeholder="/path/to/id_rsa.pub" />
+                      </label>
+                      <label class="field">
+                        <span>PubKey 私钥文件 (private_key_file)</span>
+                        <input type="text" id="sessAuthPrivKey" class="input-text mono" placeholder="/path/to/id_rsa" />
+                      </label>
+                      <label class="field span-2">
+                        <span>PubKey 信任公钥列表 (known_keys_file)</span>
+                        <input type="text" id="sessAuthKnownKeys" class="input-text mono" placeholder="/path/to/known_keys" />
+                      </label>
+                      <label class="field">
+                        <span>访问控制 ACL 开关</span>
+                        <label class="check-card"><input type="checkbox" id="sessAclEnabled" /><span>access_control.enabled</span></label>
+                      </label>
+                      <label class="field">
+                        <span>ACL 默认策略 (default_permission)</span>
+                        <select id="sessAclDefaultPerm" class="input-select">
+                          <option value="deny">deny (默认拒绝)</option>
+                          <option value="allow">allow (默认允许)</option>
+                        </select>
+                      </label>
+                      <label class="field span-2">
+                        <span>完整 ACL JSON5 对象（留空则仅用上方开关；填写则完整覆盖 <code>access_control</code>）</span>
+                        <textarea id="sessAclJson5" class="input-textarea mono" rows="3" placeholder='{ enabled: true, default_permission: "deny", rules: [], subjects: [], policies: [] }'></textarea>
+                      </label>
+                    </div>
+                  </div>
+                </details>
+
+                <!-- Group 6: Routing, Timestamping, AdminSpace, Kernel Flow Control & Plugins -->
+                <details class="cfg-group">
+                  <summary>6. 路由、时间戳、AdminSpace、内核流控与插件 (Routing / Downsampling / LowPass / QoS / Plugins)</summary>
+                  <div class="cfg-group-body">
+                    <div class="toggle-grid" style="margin-bottom:10px">
+                      <label class="check-card"><input type="checkbox" id="sessTimestamp" /><span>HLC Timestamping</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessDropFutureTs" /><span>Drop Future Timestamp</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessFailoverBroker" /><span>Peers Failover Brokering</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessAdminEn" /><span>启用 AdminSpace (@/**)</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessAdminRead" /><span>AdminSpace 只读</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessAdminWrite" /><span>AdminSpace 可写</span></label>
+                      <label class="check-card"><input type="checkbox" id="sessPluginsLoad" /><span>启用 Plugins Loading</span></label>
+                    </div>
+                    <div class="form-grid">
+                      <label class="field span-2">
+                        <span>Peer 路由模式 (routing.peer.mode)</span>
+                        <select id="sessPeerRoutingMode" class="input-select">
+                          <option value="peer_to_peer">peer_to_peer (直连全网状)</option>
+                          <option value="linkstate">linkstate (多跳链路状态路由)</option>
+                        </select>
+                      </label>
+                      <label class="field span-2">
+                        <span>内核级降采样 (<code>downsampling</code> JSON5 数组)</span>
+                        <textarea id="sessDownsampling" class="input-textarea mono" rows="2" placeholder='[{ messages: ["put"], rules: [{ key_expr: "swarm/data/**/cloud_registered", freq: 2.0 }] }]'></textarea>
+                      </label>
+                      <label class="field span-2">
+                        <span>内核级低通大小过滤 (<code>low_pass_filter</code> JSON5 数组)</span>
+                        <textarea id="sessLowPass" class="input-textarea mono" rows="2" placeholder='[{ flows: ["egress"], key_exprs: ["swarm/**"], size_limit: 65536 }]'></textarea>
+                      </label>
+                      <label class="field span-2">
+                        <span>内核级发布 QoS 覆写 (<code>qos.publication</code> JSON5 数组)</span>
+                        <textarea id="sessQosPub" class="input-textarea mono" rows="2" placeholder='[{ key_exprs: ["swarm/data/**/state"], config: { priority: "real_time", express: true } }]'></textarea>
+                      </label>
+                      <label class="field span-2">
+                        <span>内核级网络 DSCP/QoS 覆写 (<code>qos.network</code> JSON5 数组)</span>
+                        <textarea id="sessQosNet" class="input-textarea mono" rows="2" placeholder='[]'></textarea>
+                      </label>
+                      <label class="field span-2">
+                        <span>路由聚合 (<code>aggregation</code> JSON5 对象)</span>
+                        <textarea id="sessAggregation" class="input-textarea mono" rows="2" placeholder='{ subscribers: [], publishers: [] }'></textarea>
+                      </label>
+                      <label class="field span-2">
+                        <span>官方插件配置 (<code>plugins</code> JSON5 对象，如 rest / storage_manager / remote_api)</span>
+                        <textarea id="sessPluginsJson5" class="input-textarea mono" rows="2" placeholder='{ rest: { http_port: 8000 } }'></textarea>
+                      </label>
+                    </div>
+                  </div>
+                </details>
+
+                <!-- Group 7: True JSON5 Override -->
+                <details class="cfg-group" open>
+                  <summary>7. 额外原生 JSON5 叠加覆盖（真 JSON5：由 Zenoh 内核直接解析，支持 // 注释与尾逗号）</summary>
+                  <div class="cfg-group-body">
+                    <textarea id="sessCustomJson" class="input-textarea mono" rows="4" placeholder='// 任意官方 Zenoh 1.8 JSON5 片段，如：&#10;{&#10;  stats: { filters: [] },&#10;  open: { return_conditions: { connect_scouted: true } },&#10;}'></textarea>
+                    <div class="btn-row mt-6" style="justify-content:flex-end">
+                      <button class="btn btn-xs btn-secondary" id="btnSwitchToRawWithEffective">复制当前生效配置到「原生完整 JSON5」编辑 &rarr;</button>
+                    </div>
+                  </div>
+                </details>
+              </div>
+
+              <!-- RAW JSON5 FULL-CONFIG MODE -->
+              <div id="cfgModeRawJson5" class="hidden">
+                <div class="btn-row" style="margin-bottom:8px;flex-wrap:wrap">
+                  <button class="btn btn-xs btn-secondary" id="btnRawLoadEffective">载入当前生效配置</button>
+                  <button class="btn btn-xs btn-ghost" id="btnRawLoadDefault">载入官方 1.8 默认模板</button>
+                  <button class="btn btn-xs btn-ghost" id="btnRawImport">导入 .json5</button>
+                  <button class="btn btn-xs btn-ghost" id="btnRawExport">导出 .json5</button>
+                  <input type="file" id="rawJson5FileInput" accept=".json5,.json,.txt" class="hidden" />
+                </div>
+                <textarea id="sessRawJson5" class="input-textarea mono code-editor" placeholder='// 直接编写完整官方 Zenoh 1.8 JSON5 配置，原生透传 zenoh::Config::from_str()'></textarea>
+              </div>
+
+              <div id="cfgValidateBox" class="validate-box hidden mono"></div>
+            </div>
+
+            <!-- Right Column: Topology, Transports, Links & Effective Config -->
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <h3>Zenoh 实时拓扑、传输与链路监控</h3>
+                  <p class="muted small">调用官方 <code>get_transports()</code> / <code>get_links()</code> 实时透视协议、Locator、MTU 与完整生效配置</p>
+                </div>
+                <div class="btn-row">
+                  <button class="btn btn-xs btn-ghost" id="btnCopyEffective">复制 JSON5</button>
+                </div>
+              </div>
+
+              <div class="topo-box">
+                <div class="topo-row">
+                  <span class="muted">本机 ZID</span>
+                  <code id="infoOwnZid">--</code>
+                </div>
+                <div class="topo-row">
+                  <span class="muted">已连接 Peers (<span id="infoPeerCount">0</span>)</span>
+                  <div class="zid-list" id="infoPeerZids"></div>
+                </div>
+                <div class="topo-row">
+                  <span class="muted">已连接 Routers (<span id="infoRouterCount">0</span>)</span>
+                  <div class="zid-list" id="infoRouterZids"></div>
+                </div>
+              </div>
+
+              <div class="sub-title">活跃传输层 (Transports · <span id="infoTransportCount">0</span>)</div>
+              <div class="table-wrap" style="max-height:150px;overflow-y:auto">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Remote ZID</th>
+                      <th>角色</th>
+                      <th>特性</th>
+                    </tr>
+                  </thead>
+                  <tbody id="transportsTbody">
+                    <tr><td colspan="3" class="empty-hint">暂无活跃 Transport</td></tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <div class="sub-title">活跃物理链路 (Links · <span id="infoLinkCount">0</span>)</div>
+              <div class="table-wrap" style="max-height:170px;overflow-y:auto">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Src &rarr; Dst Locator</th>
+                      <th>MTU</th>
+                      <th>特性 / 网卡</th>
+                    </tr>
+                  </thead>
+                  <tbody id="linksTbody">
+                    <tr><td colspan="3" class="empty-hint">暂无活跃 Link</td></tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <details class="mt-12" open>
+                <summary class="small muted pointer">查看当前生效的完整 Zenoh 1.8 JSON5 配置</summary>
+                <pre class="code-box mono mt-6" id="effectiveConfigPre">Loading...</pre>
+              </details>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 4: ZENOH LAB -->
+        <section class="tab-panel" id="tab-lab">
+          <div class="grid-2">
+            <!-- PUT & DELETE Tool -->
+            <div class="card">
+              <div class="card-header">
+                <h3>Zenoh PUT / DELETE 测试</h3>
+                <div class="btn-row">
+                  <button class="btn btn-sm btn-danger" id="btnLabDelete">发送 DELETE</button>
+                  <button class="btn btn-sm btn-primary" id="btnLabPut">发送 PUT</button>
+                </div>
+              </div>
+              <div class="form-grid">
+                <label class="field span-2">
+                  <span>Key Expression</span>
+                  <input type="text" id="labPutKey" class="input-text mono" value="swarm/test/hello" />
+                </label>
+                <label class="field">
+                  <span>Encoding</span>
+                  <select id="labPutEnc" class="input-select">
+                    <option value="text/plain">text/plain</option>
+                    <option value="application/json">application/json</option>
+                    <option value="application/octet-stream">application/octet-stream</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>Priority</span>
+                  <select id="labPutPrio" class="input-select">
+                    <option value="real_time">real_time</option>
+                    <option value="interactive_high">interactive_high</option>
+                    <option value="interactive_low">interactive_low</option>
+                    <option value="data_high">data_high</option>
+                    <option value="data" selected>data</option>
+                    <option value="data_low">data_low</option>
+                    <option value="background">background</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>Congestion / Reliability</span>
+                  <div class="btn-row">
+                    <select id="labPutCong" class="input-select flex-1">
+                      <option value="drop">drop</option>
+                      <option value="block">block</option>
+                      <option value="block_first">block_first</option>
+                    </select>
+                    <select id="labPutRel" class="input-select flex-1">
+                      <option value="reliable">reliable</option>
+                      <option value="best_effort">best_effort</option>
+                    </select>
+                  </div>
+                </label>
+                <label class="field">
+                  <span>Locality / Express</span>
+                  <div class="btn-row">
+                    <select id="labPutLoc" class="input-select flex-1">
+                      <option value="any">any</option>
+                      <option value="remote">remote</option>
+                      <option value="session_local">session_local</option>
+                    </select>
+                    <label class="check-inline"><input type="checkbox" id="labPutExpress" /><span>Express</span></label>
+                  </div>
+                </label>
+                <label class="field span-2">
+                  <span>Attachment (可选元数据)</span>
+                  <input type="text" id="labPutAtt" class="input-text mono" placeholder='可选，如 {"src":"lab"}' />
+                </label>
+                <label class="field span-2">
+                  <span>Payload</span>
+                  <textarea id="labPutPayload" class="input-textarea mono" rows="2">{"hello": "aceswarm"}</textarea>
+                </label>
+              </div>
+              <pre class="code-box mono mt-8" id="labPutResult">等待发送...</pre>
+            </div>
+
+            <!-- GET & AdminSpace Tool -->
+            <div class="card">
+              <div class="card-header">
+                <h3>Zenoh GET &amp; AdminSpace 查询</h3>
+                <button class="btn btn-sm btn-primary" id="btnLabGet">执行 GET</button>
+              </div>
+              <div class="quick-chips">
+                <button class="chip-btn" data-get-key="swarm/ctrl/*/rules" data-get-payload='{"action":"get"}'>集群 RPC 状态</button>
+                <button class="chip-btn" data-get-key="@/**" data-get-payload="">AdminSpace @/**</button>
+                <button class="chip-btn" data-get-key="@/*/peer" data-get-payload="">节点信息 @/*/peer</button>
+                <button class="chip-btn" data-get-key="@/*/session/transport/**" data-get-payload="">传输链路 @/*/transport/**</button>
+              </div>
+              <div class="form-grid">
+                <label class="field span-2">
+                  <span>Key Expression（查询 <code>@/**</code> 需在内核配置中开启 <code>AdminSpace</code>）</span>
+                  <input type="text" id="labGetKey" class="input-text mono" value="swarm/ctrl/*/rules" />
+                </label>
+                <label class="field">
+                  <span>Target</span>
+                  <select id="labGetTarget" class="input-select">
+                    <option value="best_matching">best_matching</option>
+                    <option value="all" selected>all</option>
+                    <option value="all_complete">all_complete</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>Consolidation / Timeout (ms)</span>
+                  <div class="btn-row">
+                    <select id="labGetCons" class="input-select flex-1">
+                      <option value="auto">auto</option>
+                      <option value="none">none</option>
+                      <option value="monotonic">monotonic</option>
+                      <option value="latest">latest</option>
+                    </select>
+                    <input type="number" id="labGetTimeout" class="input-num" value="3000" style="width:86px" />
+                  </div>
+                </label>
+                <label class="field span-2">
+                  <span>Optional Query Payload</span>
+                  <input type="text" id="labGetPayload" class="input-text mono" value='{"action":"get"}' />
+                </label>
+              </div>
+              <pre class="code-box mono mt-8" id="labGetResult">等待查询...</pre>
+            </div>
+          </div>
+
+          <!-- Active Scouting & Liveliness Row -->
+          <div class="grid-2 mt-14">
+            <!-- Active Scouting -->
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <h3>主动网络扫描 (Zenoh Scouting)</h3>
+                  <p class="muted small">调用官方 <code>zenoh::scout()</code> 发现局域网所有 Zenoh 节点（含外部 zenohd / rmw_zenoh）</p>
+                </div>
+                <button class="btn btn-sm btn-primary" id="btnScoutRun">开始扫描</button>
+              </div>
+              <div class="btn-row" style="margin-bottom:10px">
+                <select id="scoutWhat" class="input-select">
+                  <option value="router_peer">Router + Peer</option>
+                  <option value="router">仅 Router</option>
+                  <option value="peer">仅 Peer</option>
+                </select>
+                <input type="number" id="scoutTimeout" class="input-num" value="1500" min="200" max="10000" step="200" title="timeout_ms" />
+                <span class="muted small">ms</span>
+              </div>
+              <div class="table-wrap" style="max-height:220px;overflow-y:auto">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>ZID</th>
+                      <th style="width:72px">角色</th>
+                      <th>Locators</th>
+                      <th style="width:92px">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="scoutTbody">
+                    <tr><td colspan="4" class="empty-hint">点击「开始扫描」探测局域网 Zenoh 节点</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <!-- Liveliness Monitor -->
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <h3>在线存活性令牌 (Zenoh Liveliness)</h3>
+                  <p class="muted small">官方零心跳在线检测：查询全网存活令牌，或声明/注销自定义测试令牌</p>
+                </div>
+                <button class="btn btn-sm btn-primary" id="btnLiveQuery">查询令牌</button>
+              </div>
+              <div class="btn-row" style="margin-bottom:8px">
+                <input type="text" id="liveQueryKey" class="input-text mono flex-1" value="swarm/alive/**" placeholder="swarm/alive/** 或 **" />
+              </div>
+              <div class="btn-row" style="margin-bottom:10px">
+                <input type="text" id="liveDeclareKey" class="input-text mono flex-1" placeholder="自定义声明令牌，如 swarm/alive/test_sensor" />
+                <button class="btn btn-xs btn-secondary" id="btnLiveDeclare">声明</button>
+                <button class="btn btn-xs btn-danger" id="btnLiveUndeclare">注销</button>
+              </div>
+              <div class="table-wrap" style="max-height:190px;overflow-y:auto">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>存活令牌 Key Expression</th>
+                      <th style="width:78px">状态</th>
+                    </tr>
+                  </thead>
+                  <tbody id="liveTbody">
+                    <tr><td colspan="2" class="empty-hint">点击「查询令牌」获取全网 Liveliness 令牌</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <!-- Live Sniffer -->
+          <div class="card mt-14">
+            <div class="card-header">
+              <div>
+                <h3>实时 Key 抓包监视器 (Live Sniffer)</h3>
+                <p class="muted small">订阅任意 Zenoh Key Expression 实时观察 PUT / DELETE 报文大小、编码、Attachment 与内容预览</p>
+              </div>
+              <div class="btn-row">
+                <input type="text" id="sniffKeyInput" class="input-text mono" value="swarm/**" style="width:240px" />
+                <button class="btn btn-sm btn-primary" id="btnSniffStart">开始监听</button>
+                <button class="btn btn-sm btn-danger" id="btnSniffStop">停止</button>
+                <button class="btn btn-sm btn-ghost" id="btnSniffClear">清空</button>
+              </div>
+            </div>
+            <div class="table-wrap" style="max-height:320px;overflow-y:auto">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th style="width:90px">时间</th>
+                    <th style="width:66px">类型</th>
+                    <th style="min-width:210px">Key Expression</th>
+                    <th style="width:72px">大小</th>
+                    <th style="width:140px">Encoding</th>
+                    <th style="min-width:170px">Attachment</th>
+                    <th>Payload 预览</th>
+                  </tr>
+                </thead>
+                <tbody id="sniffTbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div class="toast-container" id="toastContainer"></div>
+  <script src="./app.js"></script>
+</body>
+</html>

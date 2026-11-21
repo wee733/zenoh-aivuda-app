@@ -1,0 +1,5 @@
+@zenoh_bridge_api path /zenoh/api /zenoh/api/*
+handle @zenoh_bridge_api {
+  uri strip_prefix /zenoh/api
+  reverse_proxy 127.0.0.1:17447
+}

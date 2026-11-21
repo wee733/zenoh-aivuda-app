@@ -1,0 +1,13 @@
+app_id: zenoh
+name: Zenoh Bridge
+description: Official Eclipse Zenoh 1.8 C++ dynamic ROS 2 bridge with full Web UI management (JSON5 & visual kernel config, TLS/Auth/ACL/SHM/QoS/Routing, live links/scouting/liveliness, topic discovery, multi-agent remote control, and Zenoh Lab).
+version: 2.1.0
+run:
+  entrypoint: ./start.sh
+  args: []
+icon: ./assets/icon.svg
+pre_install: ./scripts/pre_install.sh
+ui_index_path: ./ui/index.html
+caddyfile_config_path: ./config/caddy/zenoh_bridge.caddy
+default_config_path: ./config/default_config.yaml
+config_schema_path: ./config/config_schema.yaml

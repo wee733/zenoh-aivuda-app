@@ -1,0 +1,9 @@
+sys:
+  robot_type: fastlio2_rotor
+  role:
+    id: 1
+ros:
+  distro: auto
+  setup_script: ""
+  discovery_range: LOCALHOST
+  domain_id: -1
