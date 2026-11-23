@@ -171,6 +171,8 @@ struct IngressRule {
   std::string qos{"auto"};          // auto | best_effort | reliable | transient_local
   int history_depth{10};
 
+  bool on_demand{false};              // Pull a peer route only while its local ROS output has readers.
+
   // Live runtime telemetry (read-only when reported in status)
   double actual_hz{0.0};
   double kbps{0.0};
@@ -240,6 +242,8 @@ struct AgentStatus {
   uint64_t dds_shield_rx_dropped{0};
   uint64_t dds_shield_tx_dropped{0};
   std::string dds_shield_error;
+  bool allow_unprefixed_local{true};
+  bool has_topic_inventory{true};
   std::vector<LocalTopicInfo> local_topics;
   std::vector<EgressRule> egress;
   std::vector<IngressRule> ingress;
@@ -670,6 +674,7 @@ inline void to_json(nlohmann::json &j, const IngressRule &r) {
       {"pattern", r.pattern},
       {"remap_prefix", r.remap_prefix},
       {"exclude_self", r.exclude_self},
+      {"on_demand", r.on_demand},
       {"max_freq", r.max_freq},
       {"enabled", r.enabled},
       {"locality", r.locality},
@@ -688,6 +693,7 @@ inline void from_json(const nlohmann::json &j, IngressRule &r) {
   r.pattern = j.value("pattern", "");
   r.remap_prefix = j.value("remap_prefix", "");
   r.exclude_self = j.value("exclude_self", true);
+  r.on_demand = j.value("on_demand", false);
   r.max_freq = j.value("max_freq", 30.0);
   r.enabled = j.value("enabled", true);
   r.locality = normalizeLocalityName(j.value("locality", "any"));
@@ -701,6 +707,14 @@ inline void from_json(const nlohmann::json &j, IngressRule &r) {
     r.active_endpoints = j["active_endpoints"].get<std::vector<std::string>>();
   }
   r.last_error = j.value("last_error", "");
+}
+
+template <class Rule> nlohmann::json portableRule(const Rule &rule) {
+  nlohmann::json fields = rule;
+  for (const char *key : {"actual_hz", "kbps", "dropped_count", "last_error", "tx_count", "has_subscribers",
+                           "resolved_type", "bound_topic", "effective_key", "rx_count", "active_endpoints"})
+    fields.erase(key);
+  return fields;
 }
 
 inline void to_json(nlohmann::json &j, const LogEntry &e) {
@@ -781,10 +795,12 @@ inline void to_json(nlohmann::json &j, const AgentStatus &s) {
       {"dds_shield_rx_dropped", s.dds_shield_rx_dropped},
       {"dds_shield_tx_dropped", s.dds_shield_tx_dropped},
       {"dds_shield_error", s.dds_shield_error},
+      {"allow_unprefixed_local", s.allow_unprefixed_local},
       {"local_topics", s.local_topics},
       {"egress", s.egress},
       {"ingress", s.ingress},
   };
+  if (!s.has_topic_inventory) j.erase("local_topics");
 }
 
 inline void from_json(const nlohmann::json &j, AgentStatus &s) {
@@ -815,7 +831,9 @@ inline void from_json(const nlohmann::json &j, AgentStatus &s) {
   s.dds_shield_rx_dropped = j.value("dds_shield_rx_dropped", uint64_t{0});
   s.dds_shield_tx_dropped = j.value("dds_shield_tx_dropped", uint64_t{0});
   s.dds_shield_error = j.value("dds_shield_error", "");
-  if (j.contains("local_topics") && j["local_topics"].is_array()) {
+  s.allow_unprefixed_local = j.value("allow_unprefixed_local", true);
+  s.has_topic_inventory = j.contains("local_topics") && j["local_topics"].is_array();
+  if (s.has_topic_inventory) {
     s.local_topics = j["local_topics"].get<std::vector<LocalTopicInfo>>();
   } else {
     s.local_topics.clear();
@@ -868,6 +886,7 @@ inline RuleSet loadRulesFromYamlFile(const std::string &path) {
       IngressRule r;
       r.pattern = node["pattern"] ? node["pattern"].as<std::string>() : "";
       r.remap_prefix = node["remap_prefix"] ? node["remap_prefix"].as<std::string>() : "";
+      r.on_demand = node["on_demand"] && node["on_demand"].as<bool>();
       r.exclude_self = node["exclude_self"] ? node["exclude_self"].as<bool>() : true;
       r.max_freq = node["max_freq"] ? node["max_freq"].as<double>() : 30.0;
       r.enabled = node["enabled"] ? node["enabled"].as<bool>() : true;
@@ -925,7 +944,7 @@ inline void atomicWriteFile(const std::string &path, const std::string &content,
   }
 }
 
-inline void saveRulesToYamlFile(const std::string &path, const RuleSet &rules) {
+inline std::string rulesToYaml(const RuleSet &rules) {
   YAML::Emitter out;
   out << YAML::BeginMap;
   out << YAML::Key << "schema" << YAML::Value << kProtocolSchemaVersion;
@@ -956,6 +975,7 @@ inline void saveRulesToYamlFile(const std::string &path, const RuleSet &rules) {
     out << YAML::BeginMap;
     out << YAML::Key << "pattern" << YAML::Value << r.pattern;
     if (!r.remap_prefix.empty()) out << YAML::Key << "remap_prefix" << YAML::Value << r.remap_prefix;
+    out << YAML::Key << "on_demand" << YAML::Value << r.on_demand;
     out << YAML::Key << "exclude_self" << YAML::Value << r.exclude_self;
     out << YAML::Key << "max_freq" << YAML::Value << r.max_freq;
     out << YAML::Key << "enabled" << YAML::Value << r.enabled;
@@ -967,7 +987,11 @@ inline void saveRulesToYamlFile(const std::string &path, const RuleSet &rules) {
   out << YAML::EndSeq;
   out << YAML::EndMap;
 
-  atomicWriteFile(path, std::string(out.c_str()) + "\n",
+  return std::string(out.c_str()) + "\n";
+}
+
+inline void saveRulesToYamlFile(const std::string &path, const RuleSet &rules) {
+  atomicWriteFile(path, rulesToYaml(rules),
                   "Failed while writing rules file: ", "Failed to atomically replace rules file: ");
 }
 
@@ -1025,6 +1049,13 @@ inline RuleSet makePresetRules(const std::string &preset_name) {
         {"*/mavros/local_position/pose", "", true, 30.0, true, "any", "auto", 10},
         {"*/camera/image_raw/compressed", "", true, 5.0, false, "any", "best_effort", 5},
     };
+    for (const auto &[topic, type] : std::map<std::string, std::string>{
+             {"camera/video/h264", "foxglove_msgs/msg/CompressedVideo"},
+             {"camera/image_compressed", "sensor_msgs/msg/CompressedImage"}}) {
+      rs.egress.push_back({topic, type, "", 0.0, 0.0, true, true, "data_low", "drop", false,
+                           "best_effort", "remote", "best_effort", 5});
+      rs.ingress.push_back({"*/" + topic, "", true, 0.0, true, "remote", "best_effort", 5, true});
+    }
     return rs;
   }
 

@@ -17,7 +17,7 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include "zenoh_bridge/bridge_node.hpp"
-#include "zenoh_bridge/config_file.hpp"
+#include "zenoh_bridge/config_transaction.hpp"
 #include "zenoh_bridge/dds_shield.hpp"
 
 namespace {
@@ -98,6 +98,13 @@ int run(int argc, char **argv) {
   fs::create_directories(path.parent_path());
   startup.settings_path = (fs::canonical(path.parent_path()) / path.filename()).string();
   OwnerLock lock(startup.settings_path);
+  auto configuredPath = [&](const std::string &key) {
+    const auto it = params.find(key);
+    return j.value(key, it == params.end() ? std::string{} : it->second.as_string());
+  };
+  zenoh_bridge::recoverConfigFiles({{"bridge_settings", startup.settings_path},
+                                    {"routes", configuredPath("rules_file")},
+                                    {"session_override", configuredPath("session_override_file")}});
   startup.persisted = readConfigObject(startup.settings_path, true);
   startup.shield_script = (root / "scripts" / "dds_shield.sh").string();
   // Older runtime files include this redundant field. Never execute an

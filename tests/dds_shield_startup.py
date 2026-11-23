@@ -103,7 +103,7 @@ void rcl_init(void) { _exit(73); }
     shutil.copy2(repo / 'start.sh', root / 'start.sh')
     shutil.copy2(repo / 'scripts/ros_setup.sh', scripts / 'ros_setup.sh')
     cfg = root / 'default.yaml'
-    cfg.write_text('ros:\n  domain_id: 7\n')
+    cfg.write_text('zenoh:\n  ros_domain_id: 7\n')
     check(executable=root / 'start.sh', rc=73, expected=expected, AIVUDA_APP_CONFIG_PATH=str(cfg),
           HOME=str(root))
     print('PASS: packaged launcher uses the same enforced startup path')
@@ -121,7 +121,7 @@ void rcl_init(void) { _exit(73); }
             deadline = time.monotonic() + 12
             while True:
                 output = (root / 'node.log').read_text()
-                if 'Zenoh Bridge v2.2 started' in output:
+                if 'started: agent_id=' in output:
                     break
                 assert p.poll() is None and time.monotonic() < deadline, output
                 time.sleep(0.05)

@@ -14,7 +14,7 @@
       <div class="brand">
         <img class="brand-logo" src="./zenoh-icon.png" width="32" height="32" alt="" />
         <div>
-          <div class="brand-title">Zenoh Bridge <span class="badge badge-info">v2.2</span></div>
+          <div class="brand-title">Zenoh Bridge <span class="badge badge-info">v2.3.0</span></div>
           <div class="brand-sub" id="localSummary">Connecting to local Zenoh engine...</div>
         </div>
       </div>
@@ -53,18 +53,26 @@
         <div class="sidebar-section">
           <div class="sidebar-section-title">一键预设 (Presets)</div>
           <select id="presetSelect" class="input-select full-width">
-            <option value="formation">Formation (通用编队)</option>
-            <option value="uxrce_swarm">uXRCE Swarm (PX4 DDS)</option>
-            <option value="vision_debug">Vision &amp; LiDAR Debug</option>
-            <option value="low_bandwidth">Low Bandwidth (低带宽)</option>
-            <option value="empty">Empty (清空规则)</option>
+            <option value="current" selected>当前节点路由</option>
+            <optgroup label="内置预设">
+              <option value="formation">Formation (通用编队)</option>
+              <option value="uxrce_swarm">uXRCE Swarm (PX4 DDS)</option>
+              <option value="vision_debug">Vision &amp; LiDAR Debug</option>
+              <option value="low_bandwidth">Low Bandwidth (低带宽)</option>
+              <option value="empty">Empty (清空规则)</option>
+            </optgroup>
+            <optgroup label="自定义 JSON 预设" id="customPresetGroup"></optgroup>
           </select>
           <div class="btn-row mt-8">
-            <button class="btn btn-sm btn-secondary flex-1" id="btnApplyPresetOne">应用当前节点</button>
-            <button class="btn btn-sm btn-primary flex-1" id="btnApplyPresetAll">推送全部在线</button>
+            <button class="btn btn-sm btn-primary flex-1" id="btnApplyPresetOne">应用当前节点</button>
           </div>
+          <div class="btn-row mt-6">
+            <button class="btn btn-xs btn-ghost flex-1" id="btnPresetImportJson" title="导入路由预设并应用到当前节点，或预览完整配置">导入外部 JSON</button>
+            <button class="btn btn-xs btn-ghost flex-1" id="btnPresetExportJson" title="导出当前选中节点的完整 JSON 配置" disabled>导出当前 JSON</button>
+          </div>
+          <input type="file" id="presetJsonFileInput" accept=".json,application/json" class="hidden" />
           <label class="check-inline mt-6">
-            <input type="checkbox" id="chkPresetSave" checked />
+            <input type="checkbox" id="chkPresetSave" />
             <span>同时持久化到 routes.yaml</span>
           </label>
         </div>
@@ -95,16 +103,16 @@
             <div class="shield-bar-left">
               <strong>🛡️ DDS 端口过滤</strong>
               <label class="check-inline" title="过滤非回环接口的 IPv4/IPv6 UDP 标准 RTPS 端口。同端口的其他 UDP 流量也可能被拦截；不覆盖自定义端口或 TCP。">
-                <input type="checkbox" id="coreShieldEnabled" />
+                <input type="checkbox" id="coreShieldEnabled" disabled />
                 <span>启用隔离</span>
               </label>
-              <select id="coreShieldScope" class="input-select" title="选择隔离范围">
+              <select id="coreShieldScope" disabled class="input-select" title="选择隔离范围">
                 <option value="domain">指定域的标准 RTPS 端口</option>
                 <option value="all">指定域端口 + 各域的标准发现组播端口</option>
               </select>
-              <input type="text" id="coreShieldDomains" class="input-text mono" style="width:130px" placeholder="自动跟随 ROS 域" title="逗号分隔的域编号（0–232）；留空使用节点当前 ROS_DOMAIN_ID" />
-              <input type="password" class="input-text" id="shieldToken" aria-label="DDS 过滤管理令牌" placeholder="本机管理令牌" autocomplete="off" spellcheck="false" />
-              <button class="btn btn-xs btn-primary" id="btnCoreShieldApply" disabled>应用到本机</button>
+              <input type="text" id="coreShieldDomains" disabled class="input-text mono" style="width:130px" placeholder="自动跟随 ROS 域" title="逗号分隔的域编号（0–232）；留空使用节点当前 ROS_DOMAIN_ID" />
+              <input type="password" class="input-text" id="shieldToken" hidden aria-describedby="coreShieldStatus" aria-label="DDS 过滤管理令牌" placeholder="本机管理令牌" autocomplete="off" spellcheck="false" />
+              <button class="btn btn-xs btn-primary" id="btnCoreShieldApply" aria-describedby="coreShieldStatus" disabled>应用到本机</button>
             </div>
             <div class="shield-bar-right">
               <span class="small muted mono" id="coreShieldStatus">等待节点状态</span>
@@ -117,10 +125,6 @@
               <span class="muted small" id="routesHint">修改后点击「热更新」立即生效，无需重启节点</span>
             </div>
             <div class="action-bar-right">
-              <button class="btn btn-sm btn-ghost" id="btnReloadRules">放弃修改</button>
-              <button class="btn btn-sm btn-ghost" id="btnExportRules">导出 JSON</button>
-              <button class="btn btn-sm btn-ghost" id="btnImportRules">导入 JSON</button>
-              <input type="file" id="importFileInput" accept=".json" class="hidden" />
               <button class="btn btn-sm btn-secondary" id="btnApplyLive">热更新 (Apply Live)</button>
               <button class="btn btn-sm btn-primary" id="btnApplySave">热更新并保存 (Save)</button>
             </div>
@@ -965,6 +969,28 @@
     </div>
   </div>
 
+  <dialog id="configDialog" class="config-dialog" aria-labelledby="configDialogTitle">
+    <h2 id="configDialogTitle">导入配置</h2>
+    <p id="configImportSource"></p>
+    <fieldset id="configImportOptions">
+      <legend>导入选项</legend>
+      <label>路由模式
+        <select id="configImportMode" class="input-select">
+          <option value="merge">合并同名路由</option>
+          <option value="replace">替换全部路由</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="importRoutes" checked /> 路由规则</label>
+      <label><input type="checkbox" id="importBridge" checked /> 桥接设置</label>
+      <label><input type="checkbox" id="importSession" checked /> 会话配置</label>
+      <label><input type="checkbox" id="importAgentId" /> 使用文件中的节点 ID</label>
+    </fieldset>
+    <p id="configImportResult" role="status" aria-live="polite"></p>
+    <div class="btn-row">
+      <button id="cancelConfigImport" class="btn btn-sm btn-ghost">取消</button>
+      <button id="confirmConfigImport" class="btn btn-sm btn-primary" disabled>确认应用</button>
+    </div>
+  </dialog>
   <div class="toast-container" id="toastContainer"></div>
   <script src="./app.js"></script>
 </body>

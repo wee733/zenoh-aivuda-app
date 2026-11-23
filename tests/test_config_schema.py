@@ -16,13 +16,12 @@ class DomainSchemaTest(unittest.TestCase):
         del legacy['zenoh']
         legacy['ros']['domain_id'] = 42
         mixed = {**legacy, 'zenoh': {'ros_domain_id': -1}}
-        for settings in (legacy, current, mixed):
+        validator.validate(current)
+        for settings in (legacy, mixed):
             with self.subTest(settings=settings):
-                validator.validate(settings)
-        for section, key in [('ros', 'domain_id'), ('zenoh', 'ros_domain_id')]:
-            invalid = copy.deepcopy(mixed)
-            invalid[section][key] = 233
-            self.assertFalse(validator.is_valid(invalid))
+                self.assertFalse(validator.is_valid(settings))
+        current['zenoh']['ros_domain_id'] = 233
+        self.assertFalse(validator.is_valid(current))
 
 
 if __name__ == '__main__':

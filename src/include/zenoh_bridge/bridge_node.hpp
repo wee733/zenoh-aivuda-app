@@ -1,6 +1,7 @@
 #ifndef ZENOH_BRIDGE_BRIDGE_NODE_HPP
 #define ZENOH_BRIDGE_BRIDGE_NODE_HPP
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -10,12 +11,14 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 #include <zenoh.hxx>
 
+#include "zenoh_bridge/binding_retry.hpp"
 #include "zenoh_bridge/http_server.hpp"
 #include "zenoh_bridge/protocol.hpp"
 
@@ -66,6 +69,7 @@ private:
     std::atomic<uint64_t> window_bytes{0};
     double last_hz{0.0};
     double last_kbps{0.0};
+    BindingRetry binding_retry;
     std::string last_error;
   };
 
@@ -82,8 +86,12 @@ private:
     std::string zenoh_pattern;
     std::optional<zenoh::Subscriber<void>> z_sub;
 
+    // Distinct peers and ROS endpoints can reuse one custom key.
+    using DemandBinding = std::tuple<std::string, std::string, std::string, std::string>;
+    std::map<DemandBinding, zenoh::Subscriber<void>> demand_subs;
     mutable std::mutex endpoints_mutex;
     std::unordered_map<std::string, std::shared_ptr<IngressEndpoint>> endpoints;
+    std::map<std::string, BindingRetry> binding_retries;
     std::string last_error;
 
     std::atomic<bool> active{true};
@@ -130,22 +138,46 @@ private:
                            std::string &out_msg, bool reconcile_shield = false,
                            const nlohmann::json &expected_policy = nullptr);
   void loadInitialRules();
+  bool applyRulesLocked(const RuleSet &rules, bool persist, std::string &message);
+  HttpResponse handleConfigTransfer(const HttpRequest &req, bool importing);
   std::shared_ptr<ActiveIngress> makeIngress(const IngressRule &rule, const RuntimeConfig &config);
   std::string localIngressTopic(const IngressRule &rule, const std::string &source,
                                 const std::string &topic) const;
   void attachEgressRosSubscriptions();
   void onDiscoveryTimer();
+  void refreshDemandIngress();
+  std::shared_ptr<IngressEndpoint> getOrCreateIngressEndpoint(
+      const std::shared_ptr<ActiveIngress> &ig, const std::string &topic,
+      const std::string &type, const std::string &source_qos);
   void onStatusTimer();
+  void publishPresence();
+  void observeHeartbeat(const zenoh::Sample &sample);
+  HttpResponse openTelemetryStream(const std::string &expressions);
+  bool heartbeat_enabled_{true};
+  bool comm_status_enabled_{true};
+  rclcpp::TimerBase::SharedPtr presence_timer_;
+  std::optional<zenoh::Subscriber<void>> heartbeat_sub_;
+  struct Neighbor {
+    std::string hostname, robot_type;
+    int64_t received_ns, received_ms;
+  };
+  std::mutex neighbors_mutex_;
+  std::map<std::string, Neighbor> neighbors_;
+  std::mutex stream_slots_mutex_;
+  std::array<std::weak_ptr<void>, 16> stream_slots_;
   RuleSet snapshotRulesLocked() const;
   static void readSessionIds(const std::shared_ptr<zenoh::Session> &session, AgentStatus &status);
   AgentStatus buildStatusSnapshot(const RuntimeConfig &config) const;
-  bool reconnectSessionLocked(RuntimeConfig next, bool persist, std::string &out_msg);
+  bool reconnectSessionLocked(RuntimeConfig next, bool persist, std::string &out_msg,
+                              const RuleSet *replacement_rules = nullptr);
 
   void handleRosMessage(const std::shared_ptr<ActiveEgress> &eg,
                         const std::shared_ptr<const rclcpp::SerializedMessage> &msg,
                         const std::string &attachment);
   void handleZenohSample(const std::shared_ptr<ActiveIngress> &ig,
-                         const zenoh::Sample &sample);
+                         const zenoh::Sample &sample,
+                         const std::shared_ptr<IngressEndpoint> &offered = nullptr,
+                         const std::string &offered_source = "");
   void handleControlQuery(const zenoh::Query &query);
   void handlePeerStatusSample(const zenoh::Sample &sample);
 
@@ -179,7 +211,7 @@ private:
   nlohmann::json handleLivelinessUndeclareApi(const nlohmann::json &body);
   nlohmann::json handleSniffStartApi(const nlohmann::json &body);
   nlohmann::json handleSniffStopApi();
-  void addLog(const std::string &level, const std::string &message);
+  void addLog(const std::string &level, const std::string &message, bool coalesce = true);
   std::vector<LogEntry> getRecentLogs(size_t max_count = 200) const;
   void clearLogs();
 
@@ -206,6 +238,7 @@ private:
   std::string default_agent_id_{"uav1"};
   std::string robot_type_;
   std::string hostname_;
+  std::string avahi_hostname_;
   std::string ros_distro_;
   std::string session_override_file_;
   std::string bridge_settings_file_;
@@ -269,7 +302,6 @@ private:
 
   // Rules and local ROS graph
   mutable std::mutex state_mutex_;
-  std::mutex rules_mutex_;
   std::mutex discovery_mutex_;
   std::vector<std::shared_ptr<ActiveEgress>> egress_list_;
   std::vector<std::shared_ptr<ActiveIngress>> ingress_list_;

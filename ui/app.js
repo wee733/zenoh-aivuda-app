@@ -1,5 +1,6 @@
 (() => {
-  const API_BASE = new URL('../api', window.location.href).href.replace(/\/$/, '');
+  // Caddy serves the API here even when the Store assigns the UI a different app ID.
+  const API_BASE = '/zenoh/api';
 
   const PRIORITIES = [
     'real_time',
@@ -70,9 +71,13 @@
   async function api(path, options = {}) {
     const resp = await fetch(`${API_BASE}${path}`, {
       ...options,
+      cache: 'no-store',
       headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
     });
-    const data = await resp.json().catch(() => ({ ok: false, message: `HTTP ${resp.status}` }));
+    const data = await resp.json().catch(() => ({
+      ok: false,
+      message: `${API_BASE}${path.split('?')[0]} 返回 HTTP ${resp.status}，响应不是有效的 JSON（${resp.headers.get('content-type') || '未知类型'}）`,
+    }));
     if (!resp.ok && data.ok === undefined) {
       data.ok = false;
     }
@@ -81,6 +86,7 @@
 
   function setDirty(flag) {
     state.dirty = flag;
+    if (flag) $('presetSelect').value = 'current';
     $('dirtyBadge').classList.toggle('hidden', !flag);
   }
 
@@ -108,6 +114,7 @@
   function selectAgent(id) {
     if (state.selectedAgentId === id) return;
     state.selectedAgentId = id;
+    $('presetSelect').value = 'current';
     $('shieldToken').value = '';
     invalidateSessionInfo();
     lastAppliedLogRequest = logRequestId;
@@ -199,6 +206,7 @@
       for (const agent of state.agents) agent.online = false;
       renderFleet();
       updateDdsShieldUi(getSelectedAgent());
+      updateConfigButtons(getSelectedAgent());
     } finally {
       clearTimeout(deadline);
     }
@@ -288,6 +296,8 @@
 
   function renderAgentBanner() {
     const ag = getSelectedAgent();
+    updateDdsShieldUi(ag);
+    updateConfigButtons(ag);
     if (!ag) return;
     const label = ag.agent_id + (ag.is_local ? ' (本机)' : ' (远端)');
     $('selectedAgentTitle').textContent = label;
@@ -298,7 +308,6 @@
     $('topicCountBadge').textContent = String((ag.local_topics || []).length);
     $('discAgentName').textContent = ag.agent_id;
     $('logsAgentName').textContent = ag.agent_id;
-    updateDdsShieldUi(ag);
     const alerts = (ag.error_count || 0) + (ag.warn_count || 0);
     const lb = $('logAlertBadge');
     if (alerts > 0) {
@@ -320,9 +329,27 @@
     return key === 'enabled' ? input.checked : input.value;
   }
 
-  function canEditShield(ag) {
-    return ag?.online && ag.is_local && ag.agent_id === state.localAgentId &&
-      typeof ag.dds_shield_configured_domains === 'string' && window.isSecureContext;
+  function shieldEditReason(ag) {
+    if (!ag) return '等待选择在线节点。';
+    if (!ag.online) return '节点离线，请在连接恢复后重试。';
+    if (!ag.is_local || ag.agent_id !== state.localAgentId) return '远端只读，请前往目标节点管理。';
+    if (typeof ag.dds_shield_configured_domains !== 'string') return '此节点未提供可编辑的过滤配置。';
+    if (ag.dds_shield_management_available === false) {
+      return ag.dds_shield_token_required ? '此连接无法管理。请确认服务绑定地址与管理令牌。'
+        : '免令牌管理需要从目标主机访问其本机网关。';
+    }
+    const url = new URL(window.location.href);
+    const isLocal = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+    if (url.protocol === 'https:' || (url.protocol === 'http:' && isLocal)) return '';
+    const appUi = /^\/(?:zenoh|app_[^/]+)\/ui(?:\/|$)/.test(url.pathname);
+    if (url.protocol === 'http:' && appUi) {
+      if (/\bElectron\//.test(window.navigator?.userAgent || '')) return '';
+      try {
+        if (window.parent && window.parent !== window && window.parent.location.origin === url.origin) return '';
+      } catch (_) { /* A cross-origin parent cannot identify the local gateway. */ }
+      if (ag.dds_shield_token_required === false && ag.dds_shield_management_available) return '';
+    }
+    return '请通过 HTTPS、本机回环地址或 AivudaOS 内嵌页面打开。';
   }
 
   function updateDdsShieldUi(ag) {
@@ -331,20 +358,28 @@
     const bar = $('ddsShieldBar');
     const barStatus = $('coreShieldStatus');
     const infoEl = $('bsDdsShieldInfo');
-    if (!ag || !pill || !txt) return;
+    const reason = shieldEditReason(ag);
+    for (const id of ['btnDdsShieldPill', 'coreShieldEnabled', 'coreShieldScope', 'coreShieldDomains', 'shieldToken', 'btnCoreShieldApply']) {
+      $(id).disabled = Boolean(reason);
+    }
+    const requiresToken = ag?.dds_shield_token_required !== false;
+    $('shieldToken').hidden = Boolean(reason) || !requiresToken;
+    if ($('shieldToken').hidden) $('shieldToken').value = '';
+    $('btnCoreShieldApply').title = reason;
+    if (!ag) {
+      barStatus.textContent = reason;
+      txt.textContent = 'DDS 隔离：等待节点';
+      shieldFormAgent = '';
+      shieldBaseline = null;
+      return;
+    }
 
     const rx = ag.dds_shield_rx_dropped || 0;
     const tx = ag.dds_shield_tx_dropped || 0;
     const total = rx + tx;
     const scope = ag.dds_shield_scope === 'all' ? 'all' : 'domain';
     const scopeLabel = `域 ${ag.dds_shield_domains || '未知'} 标准 UDP 端口` + (scope === 'all' ? '及各域发现组播端口' : '');
-    const local = ag.is_local && ag.agent_id === state.localAgentId;
-    const hasPolicy = typeof ag.dds_shield_configured_domains === 'string';
-    const editable = canEditShield(ag);
     const active = ag.online && ag.dds_shield_active && !ag.dds_shield_error;
-    for (const id of ['btnDdsShieldPill', 'coreShieldEnabled', 'coreShieldScope', 'coreShieldDomains', 'shieldToken', 'btnCoreShieldApply']) {
-      $(id).disabled = !editable;
-    }
     pill.classList.remove('active', 'inactive', 'neutral');
     pill.classList.add(active ? 'active' : 'neutral');
     if (bar) bar.classList.toggle('active', Boolean(active));
@@ -369,9 +404,9 @@
       : active ? `过滤中（拦截 ${total} 包）`
       : ag.dds_shield_enabled ? '已配置，未检测到生效规则' : '本实例未启用';
     const details = ag.dds_shield_error || (active ? `${scopeLabel} · RX ${rx} / TX ${tx}` : '');
-    const access = !ag.online ? '连接恢复前无法管理。' : !local ? '远端只读，请前往目标节点管理。'
-      : !hasPolicy ? '此节点未提供可编辑的过滤配置。'
-      : !editable ? '请使用 HTTPS 或本机回环地址管理。' : '修改需要本机管理令牌。';
+    const access = reason || (requiresToken
+      ? '请输入本机桥服务环境变量 ZENOH_BRIDGE_SHIELD_TOKEN 的值。'
+      : '当前本机连接可直接应用。');
     txt.textContent = `🛡️ ${ag.agent_id}: ${summary}`;
     pill.title = `${summary} ${details}。${access}`;
     if (barStatus) barStatus.textContent = [summary, details, access].filter(Boolean).join(' · ');
@@ -380,9 +415,10 @@
 
   async function applyDdsShield(agentId, patch) {
     const agent = getSelectedAgent();
-    if (!canEditShield(agent) || agent.agent_id !== agentId || shieldFormAgent !== agentId) return;
+    if (shieldEditReason(agent) || agent.agent_id !== agentId || shieldFormAgent !== agentId) return;
     const token = $('shieldToken').value;
-    if (!token) {
+    const requiresToken = agent.dds_shield_token_required !== false;
+    if (requiresToken && !token) {
       toast('请在「路由与流控」页输入本机的 DDS 过滤管理令牌', 'err');
       $('shieldToken').focus();
       return;
@@ -392,7 +428,7 @@
     try {
       res = await api('/dds_shield', {
         method: 'POST', redirect: 'error',
-        headers: { 'X-DDS-Shield-Token': token },
+        headers: requiresToken ? { 'X-DDS-Shield-Token': token } : {},
         body: JSON.stringify({ agent_id: agentId, ...patch, expected_policy: shieldBaseline, save: true }),
       });
     } catch (e) {
@@ -633,7 +669,7 @@
         setDirty(true);
         renderEgressTable();
         renderDiscovery();
-        toast(`已将 ${name} 加入出站草稿，点击「热更新」即可生效`, 'ok');
+        toast(`已将 ${name} 加入出站草稿，点击左侧「应用当前节点」即可生效`, 'ok');
       });
     });
   }
@@ -1053,6 +1089,102 @@
     setTimeout(() => URL.revokeObjectURL(url), 0);
   }
 
+  function updateConfigButtons(ag) {
+    for (const id of ['btnApplyPresetOne', 'btnPresetImportJson', 'btnPresetExportJson']) $(id).disabled = !ag?.online;
+  }
+
+  async function exportConfig() {
+    const agent = getSelectedAgent();
+    if (!agent?.online) return;
+    try {
+      const config = await api(`/config/export?agent_id=${encodeURIComponent(agent.agent_id)}`);
+      if (config.format_version !== 1) throw new Error(config.message || '配置格式不受支持');
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const id = agent.agent_id.replace(/[^a-zA-Z0-9_-]/g, '_');
+      downloadJson(JSON.stringify(config, null, 2) + '\n', `zenoh-config-${id}-${timestamp}.json`);
+    } catch (e) {
+      toast(`导出失败：${e.message}`, 'err');
+    }
+  }
+
+  let pendingImport = null;
+  let previewVersion = 0;
+  let validatedImport = null;
+  let importing = false;
+  const sectionInputs = { routes: 'importRoutes', bridge_settings: 'importBridge', session_override: 'importSession' };
+
+  function currentImportOptions() {
+    const sections = Object.keys(sectionInputs).filter(key => $(sectionInputs[key]).checked);
+    return { config: pendingImport.config, mode: $('configImportMode').value, sections,
+      include_agent_id: $('importAgentId').checked };
+  }
+
+  function importRequest(agentId, options, dryRun) {
+    return api(`/config/import?agent_id=${encodeURIComponent(agentId)}`, {
+      method: 'POST', redirect: 'error', body: JSON.stringify({ ...options, dry_run: dryRun }),
+    });
+  }
+
+  async function previewImport() {
+    if (!pendingImport || importing) return;
+    const version = ++previewVersion;
+    const options = currentImportOptions();
+    const target = pendingImport.target;
+    const result = $('configImportResult');
+    validatedImport = null;
+    $('confirmConfigImport').disabled = true;
+    result.textContent = '正在校验配置…';
+    try {
+      const res = await importRequest(target, options, true);
+      if (version !== previewVersion) return;
+      if (!res.ok || !res.dry_run || !res.summary) throw new Error(res.message || '服务未返回预览');
+      const s = res.summary;
+      const lines = [`校验通过。路由新增 ${s.added} 条，修改 ${s.modified} 条，删除 ${s.deleted} 条。`,
+        `导入后共有出站 ${s.egress} 条、入站 ${s.ingress} 条。`];
+      if (s.bridge_settings_changed) lines.push('桥接设置将更新。');
+      if (s.session_override_changed) lines.push('Zenoh 会话配置将更新。');
+      if (s.agent_id_changed) lines.push(`节点 ID 将改为 ${options.config.agent_id}。`);
+      if (state.dirty && options.sections.includes('routes')) lines.push('确认后将重新载入路由，覆盖当前未提交的草稿。');
+      result.textContent = lines.join('\n');
+      validatedImport = { target, options };
+      $('confirmConfigImport').disabled = false;
+    } catch (e) {
+      if (version === previewVersion) result.textContent = `校验失败：${e.message}`;
+    }
+  }
+
+  async function confirmImport() {
+    if (!validatedImport || importing) return;
+    const { target, options } = validatedImport;
+    const agent = getSelectedAgent();
+    if (!agent?.online || !agent.is_local || target !== state.localAgentId || target !== agent.agent_id) {
+      $('configImportResult').textContent = '目标已切换或离线，请重新选择文件。';
+      $('confirmConfigImport').disabled = true;
+      validatedImport = null;
+      return;
+    }
+    importing = true;
+    $('configImportOptions').disabled = true;
+    $('confirmConfigImport').disabled = true;
+    $('cancelConfigImport').disabled = true;
+    try {
+      const res = await importRequest(target, options, false);
+      if (!res.ok || res.dry_run !== false) throw new Error(res.message || '服务未确认应用');
+      $('configDialog').close();
+      if (options.sections.includes('routes')) setDirty(false);
+      state.sessionLoadedForAgent = '';
+      await pollAgents();
+      toast(`${res.agent_id || target} 配置已导入。`);
+    } catch (e) {
+      $('configImportResult').textContent = `导入未获确认：${e.message}。请重新选择文件预览。`;
+    } finally {
+      importing = false;
+      validatedImport = null;
+      $('cancelConfigImport').disabled = false;
+      $('configImportOptions').disabled = false;
+    }
+  }
+
   function initEvents() {
     bindRuleTable($('egressTbody'), 'draftEgress', EGRESS_FIELDS, '.eg-del', renderEgressTable);
     bindRuleTable($('ingressTbody'), 'draftIngress', INGRESS_FIELDS, '.ig-del', renderIngressTable);
@@ -1127,39 +1259,133 @@
       renderIngressTable();
     });
 
-    $('btnReloadRules').addEventListener('click', () => {
-      loadDraftFromSelectedAgent();
-      toast('已重新载入当前生效规则', 'ok');
-    });
-    $('btnApplyLive').addEventListener('click', () => submitRules(false));
-    $('btnApplySave').addEventListener('click', () => submitRules(true));
-
-    $('btnExportRules').addEventListener('click', () => {
-      const text = JSON.stringify({ egress: state.draftEgress, ingress: state.draftIngress }, null, 2);
-      downloadJson(text, `zenoh-rules-${state.selectedAgentId || 'agent'}.json`);
+    $('configImportOptions').addEventListener('change', previewImport);
+    $('confirmConfigImport').addEventListener('click', confirmImport);
+    $('cancelConfigImport').addEventListener('click', () => $('configDialog').close());
+    $('configDialog').addEventListener('cancel', e => { if (importing) e.preventDefault(); });
+    $('configDialog').addEventListener('close', () => {
+      ++previewVersion;
+      pendingImport = validatedImport = null;
     });
 
-    $('btnImportRules').addEventListener('click', () => $('importFileInput').click());
-    $('importFileInput').addEventListener('change', async (e) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
+    const CUSTOM_PRESETS_KEY = 'zenoh_custom_presets_v1';
+    function loadCustomPresets() {
       try {
-        const j = JSON.parse(await file.text());
-        if (Array.isArray(j.egress)) state.draftEgress = j.egress;
-        if (Array.isArray(j.ingress)) state.draftIngress = j.ingress;
-        setDirty(true);
-        renderEgressTable();
-        renderIngressTable();
-        toast('已导入规则草稿，请点击热更新使其生效', 'ok');
-      } catch (err) {
-        toast(`导入失败: ${err.message}`, 'err');
+        const raw = JSON.parse(localStorage.getItem(CUSTOM_PRESETS_KEY) || '[]');
+        return Array.isArray(raw) ? raw.filter(p => p && typeof p.id === 'string' && typeof p.name === 'string') : [];
+      } catch {
+        return [];
       }
+    }
+    function saveCustomPresets(list) {
+      localStorage.setItem(CUSTOM_PRESETS_KEY, JSON.stringify(list));
+    }
+    function renderCustomPresets(selectValue) {
+      const group = $('customPresetGroup');
+      if (!group) return;
+      const list = loadCustomPresets();
+      group.innerHTML = '';
+      for (const item of list) {
+        const opt = document.createElement('option');
+        opt.value = `custom:${item.id}`;
+        const eg = item.routes?.egress?.length || 0;
+        const ig = item.routes?.ingress?.length || 0;
+        opt.textContent = `${item.name} (出${eg}/入${ig})`;
+        group.appendChild(opt);
+      }
+      if (selectValue) $('presetSelect').value = selectValue;
+    }
+    function extractRoutesFromJson(config) {
+      const routes = config?.routes ?? config;
+      if (!routes || !('egress' in routes || 'ingress' in routes)) return null;
+      for (const key of ['egress', 'ingress']) {
+        if (key in routes && !Array.isArray(routes[key])) throw new Error(`routes.${key} 必须为数组`);
+      }
+      return { egress: routes.egress || [], ingress: routes.ingress || [] };
+    }
+
+    async function applyRoutePreset(agentId, routes, save) {
+      const preview = await importRequest(state.localAgentId, {
+        config: { format_version: 1, agent_id: agentId, routes },
+        sections: ['routes'], include_agent_id: true, mode: 'replace',
+      }, true);
+      if (!preview.ok || !preview.dry_run) throw new Error(preview.message || '路由校验失败');
+      if (state.selectedAgentId !== agentId || !getSelectedAgent()?.online) throw new Error('目标节点已切换或离线');
+      const res = await api('/rules', {
+        method: 'POST',
+        body: JSON.stringify({ agent_id: agentId, ...routes, save }),
+      });
+      if (!res.ok) throw new Error(res.message || '路由更新失败');
+      if (state.selectedAgentId === agentId) setDirty(false);
+      await pollAgents();
+      toast(`${agentId} 路由已${save ? '应用并保存' : '临时应用'}`, 'ok');
+    }
+
+    $('btnApplyLive')?.addEventListener('click', () => submitRules(false));
+    $('btnApplySave')?.addEventListener('click', () => submitRules(true));
+
+    renderCustomPresets();
+    $('btnPresetExportJson').addEventListener('click', exportConfig);
+    $('btnPresetImportJson').addEventListener('click', () => $('presetJsonFileInput').click());
+    $('presetJsonFileInput')?.addEventListener('change', async (e) => {
+      const file = e.target.files?.[0];
       e.target.value = '';
+      const agent = getSelectedAgent();
+      if (!file || !agent?.online) return;
+      const save = $('chkPresetSave').checked;
+      try {
+        const parsed = JSON.parse(await file.text());
+        if (parsed?.format_version != null && parsed.format_version !== 1) throw new Error('配置格式版本不受支持');
+        if (state.selectedAgentId !== agent.agent_id || !getSelectedAgent()?.online) throw new Error('目标节点已切换或离线');
+        const routes = extractRoutesFromJson(parsed);
+        if (!routes) throw new Error('JSON 中未找到 routes.egress / routes.ingress 路由规则');
+        const baseName = file.name.replace(/\.json$/i, '');
+        const id = `${baseName.replace(/[^a-zA-Z0-9_-]/g, '_')}_${Date.now().toString(36)}`;
+        const list = loadCustomPresets().filter(p => p.name !== baseName);
+        list.unshift({ id, name: baseName, routes, raw: parsed });
+        saveCustomPresets(list.slice(0, 30));
+        renderCustomPresets(`custom:${id}`);
+
+        const fullConfig = parsed.format_version === 1 && (parsed.bridge_settings || parsed.session_override);
+        if (!fullConfig) {
+          await applyRoutePreset(agent.agent_id, routes, save);
+        } else if (agent.is_local && agent.agent_id === state.localAgentId) {
+          pendingImport = { config: parsed, target: agent.agent_id };
+          $('configImportMode').value = 'merge';
+          for (const [section, sid] of Object.entries(sectionInputs)) {
+            $(sid).disabled = !parsed[section];
+            $(sid).checked = Boolean(parsed[section]);
+          }
+          $('importAgentId').checked = false;
+          $('configImportSource').textContent = `外部预设 ${file.name} → 本机 ${agent.agent_id}（已同时保存到左下角预设列表）`;
+          $('configDialog').showModal();
+          await previewImport();
+        } else {
+          toast(`已载入外部预设「${baseName}」（出${routes.egress.length}/入${routes.ingress.length}），点击「应用当前节点」即可生效`, 'ok');
+        }
+      } catch (err) {
+        toast(`导入外部 JSON 失败：${err.message}`, 'err');
+      }
     });
 
     $('btnApplyPresetOne').addEventListener('click', async () => {
       const preset = $('presetSelect').value;
       const save = $('chkPresetSave').checked;
+      if (!getSelectedAgent()?.online) return;
+      if (preset === 'current') {
+        await submitRules(save);
+        return;
+      }
+      if (preset.startsWith('custom:')) {
+        const item = loadCustomPresets().find(p => p.id === preset.slice('custom:'.length));
+        try {
+          if (!item) throw new Error('未找到该自定义预设');
+          await applyRoutePreset(state.selectedAgentId, item.routes, save);
+        } catch (e) {
+          toast(e.message, 'err');
+        }
+        return;
+      }
       const res = await api('/preset', {
         method: 'POST',
         body: JSON.stringify({ agent_id: state.selectedAgentId, preset, save }),
@@ -1170,22 +1396,6 @@
         await pollAgents();
       } else {
         toast(res.message || '预设应用失败', 'err');
-      }
-    });
-
-    $('btnApplyPresetAll').addEventListener('click', async () => {
-      const preset = $('presetSelect').value;
-      const save = $('chkPresetSave').checked;
-      const res = await api('/preset', {
-        method: 'POST',
-        body: JSON.stringify({ agent_id: 'all', preset, save }),
-      });
-      if (res.ok) {
-        toast(`已将预设 ${preset} 批量推送到全部在线节点`, 'ok');
-        setDirty(false);
-        await pollAgents();
-      } else {
-        toast(res.message || '批量推送失败', 'err');
       }
     });
 

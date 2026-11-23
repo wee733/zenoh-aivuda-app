@@ -43,8 +43,8 @@ def stage_node(binary, directory, helper):
 def local_api(port, timeout, token=None):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-    def api(path, body=None, *, admin=False, expected=200):
-        headers = {'Content-Type': 'application/json'}
+    def api(path, body=None, *, admin=False, expected=200, extra_headers=None):
+        headers = {'Content-Type': 'application/json', **(extra_headers or {})}
         if admin:
             assert token is not None
             headers['X-DDS-Shield-Token'] = token
@@ -69,6 +69,39 @@ def eventually(check, timeout=8):
             return
         time.sleep(.03)
     raise AssertionError(f"timed out waiting for {check.__name__}")
+
+
+def check_ingress_retry(api):
+    rule = {'pattern': '*/test', 'enabled': True}
+    api('rules', {'ingress': [rule]})
+
+    def send(msg_type, source):
+        api('zenoh/put', {'key_expr': f'test/data/{source}/test', 'payload': '',
+                          'attachment': json.dumps({'s': source, 't': msg_type})})
+
+    def errors():
+        return [e for e in api('logs')['logs'] if 'Ingress publisher failed' in e['message']]
+
+    missing = 'missing_bridge_test_interfaces/msg/Detection'
+    for _ in range(4):
+        for source in ('source_a', 'source_b'):
+            send(missing, source)
+    eventually(lambda: len(errors()) == 2)
+    assert missing in api('rules')['status']['ingress'][0]['last_error']
+    # A write to another rule must not reset an existing backoff.
+    api('rules', {'egress': [{'topic': 'unchanged_test'}], 'ingress': [rule]})
+    time.sleep(5.1)
+    for source in ('source_a', 'source_b'):
+        send(missing, source)
+        send('std_msgs/msg/String', source)
+    eventually(lambda: len(api('rules')['status']['ingress'][0]['active_endpoints']) == 2)
+    assert not api('rules')['status']['ingress'][0]['last_error']
+    assert len(errors()) == 2
+    send(missing, 'source_a')
+    eventually(lambda: len(errors()) == 3)
+    api('rules', {'ingress': [{**rule, 'enabled': False}]})
+    assert not api('rules')['status']['ingress'][0]['last_error']
+    print('PASS: missing types log once per endpoint across retries and clear on recovery or disable')
 
 
 def check_rename_bindings(api, env):
@@ -199,6 +232,8 @@ printf '%s\\n' '{"ok":true,"active":false}'
             status = api("rules", {"ingress": [{"pattern": "*/test", "active_endpoints": ["/stale"]}]})["status"]
             assert status["ingress"][0]["active_endpoints"] == [], status["ingress"]
             print("PASS: reapplying ingress does not report stale endpoints")
+
+            check_ingress_retry(api)
 
             key = "test/smoke/text"
             api("zenoh/sniff/start", {"key_expr": key})

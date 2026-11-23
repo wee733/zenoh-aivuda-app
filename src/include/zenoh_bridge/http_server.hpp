@@ -2,6 +2,8 @@
 #define ZENOH_BRIDGE_HTTP_SERVER_HPP
 
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -18,6 +20,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -29,13 +32,18 @@ struct HttpRequest {
   std::string path;
   std::map<std::string, std::string> query_params;
   std::string body;
-  bool shield_admin{false};  // Header verified by the HTTP transport; never accepted from JSON/RPC.
+  // These capabilities come only from the HTTP transport, never from JSON/RPC.
+  bool shield_admin{false};
+  bool shield_token_required{true};
+  bool shield_management_available{false};
 };
 
 struct HttpResponse {
   int status{200};
   std::string content_type{"application/json; charset=utf-8"};
   std::string body{"{}"};
+  using WriteChunk = std::function<bool(std::string_view)>;
+  std::function<void(const WriteChunk &)> stream;
 };
 
 class MiniHttpServer {
@@ -80,6 +88,9 @@ public:
       return false;
     }
 
+    loopback_binding_ = ntohl(addr.sin_addr.s_addr) == INADDR_LOOPBACK;
+    const char *token = std::getenv("ZENOH_BRIDGE_SHIELD_TOKEN");
+    shield_token_ = token ? token : "";
     running_.store(true);
     accept_thread_ = std::thread([this]() { acceptLoop(); });
     return true;
@@ -165,8 +176,9 @@ private:
       std::lock_guard<std::mutex> lk(workers_mutex_);
       clients_.insert(fd);
       try {
-        std::thread([this, fd] {
-          try { handleClient(fd); } catch (...) { /* Drop the connection. */ }
+        const bool local_peer = (ntohl(client_addr.sin_addr.s_addr) >> 24) == 127;
+        std::thread([this, fd, local_peer] {
+          try { handleClient(fd, local_peer); } catch (...) { /* Drop the connection. */ }
           std::lock_guard<std::mutex> done(workers_mutex_);
           clients_.erase(fd);
           ::close(fd);
@@ -179,7 +191,58 @@ private:
     }
   }
 
-  void handleClient(int fd) {
+  static bool isLocalAddress(const std::string &literal) {
+    in_addr v4{};
+    in6_addr v6{};
+    const bool ipv4 = ::inet_pton(AF_INET, literal.c_str(), &v4) == 1;
+    if (!ipv4 && ::inet_pton(AF_INET6, literal.c_str(), &v6) != 1) return false;
+    if (ipv4 ? (ntohl(v4.s_addr) >> 24) == 127 : IN6_IS_ADDR_LOOPBACK(&v6)) return true;
+
+    // Read current interface addresses so DHCP changes do not leave a stale grant.
+    ifaddrs *interfaces{};
+    if (::getifaddrs(&interfaces) != 0) return false;
+    bool found = false;
+    for (auto *it = interfaces; it && !found; it = it->ifa_next) {
+      if (!it->ifa_addr || !(it->ifa_flags & IFF_UP)) continue;
+      if (ipv4 && it->ifa_addr->sa_family == AF_INET) {
+        found = reinterpret_cast<const sockaddr_in *>(it->ifa_addr)->sin_addr.s_addr == v4.s_addr;
+      } else if (!ipv4 && it->ifa_addr->sa_family == AF_INET6) {
+        found = IN6_ARE_ADDR_EQUAL(&reinterpret_cast<const sockaddr_in6 *>(it->ifa_addr)->sin6_addr, &v6);
+      }
+    }
+    ::freeifaddrs(interfaces);
+    return found;
+  }
+
+  static std::string normalizedHost(std::string name) {
+    if (!name.empty() && name.back() == '.') name.pop_back();
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return name;
+  }
+
+  static bool localAuthority(const std::string &authority, bool from_gateway) {
+    if (authority.empty()) return false;
+    const bool bracketed = authority.front() == '[';
+    const auto end = bracketed ? authority.find(']') : authority.find(':');
+    if (bracketed && end == std::string::npos) return false;
+    const auto host = normalizedHost(bracketed ? authority.substr(1, end - 1) : authority.substr(0, end));
+    if (host == "localhost" || host == "127.0.0.1" || host == "::1") return true;
+    if (!from_gateway) return false;
+    if (isLocalAddress(host)) return true;
+    char name[256]{};
+    if (::gethostname(name, sizeof(name) - 1) == 0) {
+      const auto system_name = normalizedHost(name);
+      if (host == system_name || host == system_name + ".local") return true;
+    }
+    const char *configured = std::getenv("AIVUDA_OS_AVAHI_HOSTNAME");
+    if (!configured || !*configured) return false;
+    auto avahi = normalizedHost(configured);
+    if (avahi.size() > 6 && avahi.compare(avahi.size() - 6, 6, ".local") == 0) avahi.resize(avahi.size() - 6);
+    return host == avahi || host == avahi + ".local";
+  }
+
+  void handleClient(int fd, bool local_peer) {
     timeval tv{};
     tv.tv_sec = 10;
     tv.tv_usec = 0;
@@ -192,7 +255,8 @@ private:
     size_t header_end = std::string::npos;
     size_t content_length = 0;
     HttpRequest req;
-    bool saw_shield_token = false;
+    std::map<std::string, std::string> admin_headers;
+    bool unique_admin_headers = true;
 
     while (raw.size() < 4 * 1024 * 1024) {
       ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
@@ -211,13 +275,13 @@ private:
               std::string k = line.substr(0, colon);
               std::transform(k.begin(), k.end(), k.begin(),
                              [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-              if (k == "x-dds-shield-token") {
-                const char *secret = std::getenv("ZENOH_BRIDGE_SHIELD_TOKEN");
+              if (k == "host" || k == "origin" || k == "x-forwarded-for" ||
+                  k == "x-forwarded-proto" || k == "x-forwarded-host" ||
+                  k == "sec-fetch-site" || k == "x-dds-shield-token") {
                 const size_t start = line.find_first_not_of(" \t", colon + 1);
                 const size_t end = line.find_last_not_of(" \t");
-                req.shield_admin = !saw_shield_token && secret && *secret && start != std::string::npos &&
-                                  line.compare(start, end - start + 1, secret) == 0;
-                saw_shield_token = true;
+                const auto value = start == std::string::npos ? "" : line.substr(start, end - start + 1);
+                if (!admin_headers.emplace(k, value).second) unique_admin_headers = false;
               } else if (k == "content-length") {
                 std::string v = line.substr(colon + 1);
                 try {
@@ -256,8 +320,37 @@ private:
     }
     req.body = raw.substr(header_end + 4, content_length);
 
+    const auto &host = admin_headers["host"];
+    const auto origin = admin_headers.find("origin");
+    const auto forwarded = admin_headers.find("x-forwarded-for");
+    const auto proto = admin_headers.find("x-forwarded-proto");
+    const auto authority = admin_headers.find("x-forwarded-host");
+    const bool from_gateway = forwarded != admin_headers.end() && authority != admin_headers.end() &&
+        authority->second == host && proto != admin_headers.end() &&
+        (proto->second == "http" || proto->second == "https");
+    // The package's Caddy proxy replaces untrusted forwarding headers. Trust an
+    // interface address only behind that loopback hop, with one original client.
+    const bool direct = forwarded == admin_headers.end() && authority == admin_headers.end() && proto == admin_headers.end();
+    const bool local_client = loopback_binding_ && local_peer && localAuthority(host, from_gateway) &&
+        (direct || (from_gateway && isLocalAddress(forwarded->second)));
+    const bool same_origin = origin == admin_headers.end() || (from_gateway
+        ? origin->second == proto->second + "://" + host
+        : origin->second == "http://" + host);
+    const auto site = admin_headers.find("sec-fetch-site");
+    const bool same_site_request = site == admin_headers.end() || site->second == "same-origin" || site->second == "none";
+    req.shield_token_required = !shield_token_.empty() || !loopback_binding_;
+    const bool local_origin = unique_admin_headers && !host.empty() && same_origin && same_site_request;
+    req.shield_management_available = local_origin && (!shield_token_.empty() || local_client);
+    req.shield_admin = req.shield_management_available &&
+        (!req.shield_token_required || admin_headers["x-dds-shield-token"] == shield_token_);
+
+    const bool config_transfer = req.path == "/config/export" || req.path == "/api/config/export" ||
+                                 req.path == "/config/import" || req.path == "/api/config/import";
     HttpResponse resp;
-    if (req.method == "OPTIONS") {
+    if (config_transfer && !local_origin) {
+      resp.status = 403;
+      resp.body = R"({"ok":false,"message":"Configuration transfer requires a same-origin request"})";
+    } else if (req.method == "OPTIONS") {
       resp.status = 204;
       resp.body.clear();
     } else if (handler_) {
@@ -275,24 +368,29 @@ private:
     std::ostringstream out;
     out << "HTTP/1.1 " << resp.status << " " << statusReason(resp.status) << "\r\n";
     out << "Content-Type: " << resp.content_type << "\r\n";
-    out << "Content-Length: " << resp.body.size() << "\r\n";
+    if (!resp.stream) out << "Content-Length: " << resp.body.size() << "\r\n";
     out << "Cache-Control: no-store\r\n";
-    out << "Access-Control-Allow-Origin: *\r\n";
+    if (!resp.stream && !config_transfer) out << "Access-Control-Allow-Origin: *\r\n";
     out << "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n";
     out << "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
     out << "Connection: close\r\n\r\n";
-    out << resp.body;
+    if (!resp.stream) out << resp.body;
 
     const std::string wire = out.str();
-    size_t sent = 0;
-    while (sent < wire.size()) {
-      ssize_t n = ::send(fd, wire.data() + sent, wire.size() - sent, MSG_NOSIGNAL);
-      if (n <= 0) break;
-      sent += static_cast<size_t>(n);
-    }
+    auto write = [fd](std::string_view bytes) {
+      while (!bytes.empty()) {
+        const ssize_t n = ::send(fd, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+        if (n <= 0) return false;
+        bytes.remove_prefix(static_cast<size_t>(n));
+      }
+      return true;
+    };
+    if (write(wire) && resp.stream) resp.stream(write);
   }
 
   int listen_fd_{-1};
+  bool loopback_binding_{false};
+  std::string shield_token_;
   std::atomic<bool> running_{false};
   std::thread accept_thread_;
   std::mutex workers_mutex_;

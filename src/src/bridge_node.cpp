@@ -202,6 +202,8 @@ ZenohBridgeNode::ZenohBridgeNode(const StartupConfig &startup, const rclcpp::Nod
   started_epoch_ms_ = nowEpochMs();
   last_stats_ns_ = nowSteadyNs();
   hostname_ = getSystemHostname();
+  const auto *avahi = std::getenv("AIVUDA_OS_AVAHI_HOSTNAME");
+  avahi_hostname_ = avahi && *avahi ? avahi : hostname_;
 
   const char *env_distro = std::getenv("ROS_DISTRO");
   const std::string default_distro =
@@ -246,6 +248,9 @@ ZenohBridgeNode::ZenohBridgeNode(const StartupConfig &startup, const rclcpp::Nod
     loadInitialRules();
   }
 
+  if (heartbeat_enabled_ || comm_status_enabled_) {
+    presence_timer_ = create_wall_timer(std::chrono::milliseconds(500), [this] { publishPresence(); });
+  }
   discovery_timer_ = this->create_wall_timer(
       std::chrono::milliseconds(500), [this]() { onDiscoveryTimer(); });
   status_timer_ = this->create_wall_timer(
@@ -273,16 +278,17 @@ ZenohBridgeNode::ZenohBridgeNode(const StartupConfig &startup, const rclcpp::Nod
   }
 
   RCLCPP_INFO(this->get_logger(),
-              "Zenoh Bridge v2.2 started: agent_id=%s, prefix=%s, mode=%s, cfg_mode=%s, rules=%s",
+              "Zenoh Bridge v2.4.0 started: agent_id=%s, prefix=%s, mode=%s, cfg_mode=%s, rules=%s",
               config->agent_id.c_str(), config->bridge.domain_prefix.c_str(), config->session.mode.c_str(),
               config->session.config_mode.c_str(),
               rules_file_.empty() ? "(memory)" : rules_file_.c_str());
-  addLog("INFO", "Zenoh Bridge v2.2 started: agent_id=" + config->agent_id + ", prefix=" + config->bridge.domain_prefix +
+  addLog("INFO", "Zenoh Bridge v2.4.0 started: agent_id=" + config->agent_id + ", prefix=" + config->bridge.domain_prefix +
                      ", mode=" + config->session.mode + ", ros=" + ros_distro_);
 }
 
 ZenohBridgeNode::~ZenohBridgeNode() {
   http_server_.stop();
+  if (presence_timer_) presence_timer_->cancel();
   if (discovery_timer_) discovery_timer_->cancel();
   if (status_timer_) status_timer_->cancel();
   if (shield_timer_) shield_timer_->cancel();
@@ -296,6 +302,8 @@ void ZenohBridgeNode::loadStartupConfig(RuntimeConfig &config, const StartupConf
   const auto default_agent = trimSlashes(j.value("default_agent_id", default_agent_id_));
   if (!default_agent.empty()) default_agent_id_ = default_agent;
   robot_type_ = j.value("robot_type", robot_type_);
+  heartbeat_enabled_ = j.value("heartbeat_enabled", true);
+  comm_status_enabled_ = j.value("comm_status_enabled", true);
   rules_file_ = j.value("rules_file", rules_file_);
   session_override_file_ = j.value("session_override_file", session_override_file_);
   api_bind_host_ = j.value("api_bind_host", api_bind_host_);
@@ -619,6 +627,12 @@ void ZenohBridgeNode::initZenohSession(RuntimeConfig next) {
       [this](const zenoh::Sample &sample) { handlePeerStatusSample(sample); },
       zenoh::closures::none));
 
+  if (comm_status_enabled_) {
+    heartbeat_sub_.emplace(session->declare_subscriber(
+        zenoh::KeyExpr("*/heartbeat"), [this](const zenoh::Sample &s) { observeHeartbeat(s); },
+        zenoh::closures::none));
+  }
+
   // Official Zenoh Liveliness Token & Subscriber
   if (next.bridge.liveliness_enabled) {
     try {
@@ -740,6 +754,11 @@ void ZenohBridgeNode::teardownZenohSession() {
   liveliness_sub_.reset();
   own_liveliness_token_.reset();
   swarm_status_sub_.reset();
+  heartbeat_sub_.reset();
+  {
+    std::lock_guard<std::mutex> lock(neighbors_mutex_);
+    neighbors_.clear();
+  }
   // Snapshots/queries may still own the C++ handle. Close the old connection
   // now so its listeners/endpoints are released before opening a replacement.
   if (old_session) {
@@ -755,7 +774,8 @@ bool ZenohBridgeNode::reconnectSession(const SessionConfig &new_cfg, bool persis
   return reconnectSessionLocked(std::move(next), persist, out_msg);
 }
 
-bool ZenohBridgeNode::reconnectSessionLocked(RuntimeConfig next, bool persist, std::string &out_msg) {
+bool ZenohBridgeNode::reconnectSessionLocked(RuntimeConfig next, bool persist, std::string &out_msg,
+                                              const RuleSet *replacement_rules) {
   // Dry-run validate BEFORE tearing down active session!
   try {
     std::string preview;
@@ -770,21 +790,21 @@ bool ZenohBridgeNode::reconnectSessionLocked(RuntimeConfig next, bool persist, s
   const RuleSet saved_rules = getCurrentRules();
   const auto backup = configSnapshot();
 
-  auto openWithSavedRules = [&](RuntimeConfig config) {
+  auto openWithRules = [&](RuntimeConfig config, const RuleSet &rules) {
     initZenohSession(std::move(config));
     std::string message;
-    if (!applyRules(saved_rules, false, message)) throw std::runtime_error(message);
+    if (!applyRulesLocked(rules, false, message)) throw std::runtime_error(message);
   };
   teardownZenohSession();
   try {
-    openWithSavedRules(std::move(next));
+    openWithRules(std::move(next), replacement_rules ? *replacement_rules : saved_rules);
   } catch (const std::exception &e) {
     out_msg = std::string("Failed to reconfigure Zenoh session: ") + e.what();
     RCLCPP_ERROR(get_logger(), "%s — reverting to previous config", out_msg.c_str());
     addLog("ERROR", out_msg);
     teardownZenohSession();
     try {
-      openWithSavedRules(*backup);
+      openWithRules(*backup, saved_rules);
     } catch (const std::exception &rollback_error) {
       teardownZenohSession();
       out_msg += std::string("; failed to restore previous session: ") + rollback_error.what();
@@ -867,9 +887,11 @@ int ZenohBridgeNode::updateBridgeSettings(const nlohmann::json &patch, bool pers
                               policy.dds_shield_scope, policy.dds_shield_domains);
   };
   // Staging new parameters while disabled must leave a retained filter alone.
-  // Only an authorized, explicit enabled:false means remove the owner's table.
+  // An unchanged settings echo must not remove a retained filter. The dedicated
+  // Shield endpoint explicitly reconciles the kernel policy, including disable.
   const bool apply_shield = clean.dds_shield_enabled ? (reconcile_shield || shield_changed)
-      : shield_admin && patch.contains("dds_shield_enabled");
+      : shield_admin && patch.contains("dds_shield_enabled") &&
+            (reconcile_shield || current->bridge.dds_shield_enabled);
   BridgeSettings installed;
   if (apply_shield) {
     // Snapshot the verified kernel policy under the writer lock. Desired settings
@@ -946,7 +968,7 @@ void ZenohBridgeNode::loadInitialRules() {
     rules = makePresetRules(config->bridge.default_preset);
   }
   std::string msg;
-  applyRules(rules, false, msg);
+  if (!applyRulesLocked(rules, false, msg)) throw std::runtime_error(msg);
 }
 
 RuleSet ZenohBridgeNode::getCurrentRules() const {
@@ -962,7 +984,7 @@ RuleSet ZenohBridgeNode::snapshotRulesLocked() const {
     r.resolved_type = e->resolved_type;
     r.bound_topic = e->local_topic;
     r.effective_key = e->zenoh_key;
-    r.last_error = e->last_error;
+    r.last_error = e->binding_retry.step ? e->binding_retry.error : e->last_error;
     r.actual_hz = e->last_hz;
     r.kbps = e->last_kbps;
     r.tx_count = e->tx_count.load(std::memory_order_relaxed);
@@ -983,6 +1005,10 @@ RuleSet ZenohBridgeNode::snapshotRulesLocked() const {
         r.active_endpoints.push_back(kv.first);
       }
       r.last_error = i->last_error;
+      if (!i->binding_retries.empty()) {
+        const auto &[topic, retry] = *i->binding_retries.begin();
+        r.last_error = topic + " (" + retry.target + "): " + retry.error;
+      }
     }
     rs.ingress.push_back(std::move(r));
   }
@@ -990,7 +1016,11 @@ RuleSet ZenohBridgeNode::snapshotRulesLocked() const {
 }
 
 bool ZenohBridgeNode::applyRules(const RuleSet &new_rules, bool persist_to_file, std::string &out_msg) {
-  std::lock_guard<std::mutex> rules_lk(rules_mutex_);
+  std::lock_guard<std::mutex> writer(reconfigure_mutex_);
+  return applyRulesLocked(new_rules, persist_to_file, out_msg);
+}
+
+bool ZenohBridgeNode::applyRulesLocked(const RuleSet &new_rules, bool persist_to_file, std::string &out_msg) {
   std::vector<std::shared_ptr<ActiveEgress>> next_egress;
   std::vector<std::shared_ptr<ActiveIngress>> next_ingress;
   next_egress.reserve(new_rules.egress.size());
@@ -1037,8 +1067,7 @@ bool ZenohBridgeNode::applyRules(const RuleSet &new_rules, bool persist_to_file,
               zenoh::KeyExpr(eg->zenoh_key), std::move(pub_opts)));
 
           try {
-            eg->has_subscribers.store(eg->z_pub->get_matching_status().matching,
-                                      std::memory_order_relaxed);
+            // The listener reports existing matches when declared and all later transitions.
             std::weak_ptr<ActiveEgress> weak_eg = eg;
             eg->matching_listener.emplace(eg->z_pub->declare_matching_listener(
                 [weak_eg](const zenoh::MatchingStatus &status) {
@@ -1048,6 +1077,7 @@ bool ZenohBridgeNode::applyRules(const RuleSet &new_rules, bool persist_to_file,
                 },
                 zenoh::closures::none));
           } catch (const std::exception &) {
+            if (eg->rule.on_demand) throw;
             eg->has_subscribers.store(true, std::memory_order_relaxed);
           }
         }
@@ -1081,6 +1111,23 @@ bool ZenohBridgeNode::applyRules(const RuleSet &new_rules, bool persist_to_file,
     std::lock_guard<std::mutex> lk(state_mutex_);
     for (auto &e : egress_list_) e->active.store(false, std::memory_order_relaxed);
     for (auto &i : ingress_list_) i->active.store(false, std::memory_order_relaxed);
+    for (auto &previous : egress_list_) {
+      if (!previous->binding_retry.step) continue;
+      const auto fields = portableRule(previous->rule);
+      for (auto &next : next_egress) {
+        if (next->zenoh_key == previous->zenoh_key && fields == portableRule(next->rule))
+          next->binding_retry = previous->binding_retry;
+      }
+    }
+    for (auto &previous : ingress_list_) {
+      std::lock_guard<std::mutex> endpoints(previous->endpoints_mutex);
+      if (previous->binding_retries.empty()) continue;
+      const auto fields = portableRule(previous->rule);
+      for (auto &next : next_ingress) {
+        if (next->zenoh_pattern == previous->zenoh_pattern && fields == portableRule(next->rule))
+          next->binding_retries = previous->binding_retries;
+      }
+    }
     old_egress.swap(egress_list_);
     old_ingress.swap(ingress_list_);
     egress_list_ = std::move(next_egress);
@@ -1130,7 +1177,7 @@ std::shared_ptr<ZenohBridgeNode::ActiveIngress> ZenohBridgeNode::makeIngress(
   // A submitted rule may be a snapshot; only the new endpoint map is live.
   ig->rule.active_endpoints.clear();
   ig->zenoh_pattern = makeDataSubKey(config.bridge.domain_prefix, rule.pattern);
-  if (rule.enabled) {
+  if (rule.enabled && !rule.on_demand) {
     auto sub_opts = zenoh::Session::SubscriberOptions::create_default();
     sub_opts.allowed_origin = parseLocality(rule.locality);
     std::weak_ptr<ActiveIngress> weak_ig = ig;
@@ -1217,7 +1264,8 @@ void ZenohBridgeNode::attachEgressRosSubscriptions() {
       topic = name;
       return true;
     };
-    if (!select(prefixed) && !(allow_unprefixed && select(bare))) {
+    const bool idle = eg->rule.on_demand && !eg->has_subscribers.load();
+    if (idle || (!select(prefixed) && !(allow_unprefixed && select(bare)))) {
       if (eg->ros_sub) {
         ++eg->binding_generation;
         eg->ros_sub.reset();
@@ -1232,7 +1280,14 @@ void ZenohBridgeNode::attachEgressRosSubscriptions() {
     if (eg->ros_sub && eg->local_topic == topic && eg->resolved_type == type &&
         eg->ros_sub->get_actual_qos().reliability() == qos.reliability() &&
         eg->ros_sub->get_actual_qos().durability() == qos.durability()) {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      eg->binding_retry = {};
       continue;
+    }
+    const std::string target = topic + " (" + type + ")";
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (!eg->binding_retry.ready(target)) continue;
     }
     const std::string reliability = (qos.reliability() == rclcpp::ReliabilityPolicy::BestEffort)
                                         ? "best_effort"
@@ -1257,6 +1312,7 @@ void ZenohBridgeNode::attachEgressRosSubscriptions() {
       eg->ros_sub.swap(sub);
       eg->local_topic = topic;
       eg->resolved_type = type;
+      eg->binding_retry = {};
       eg->last_error.clear();
       eg->binding_generation.store(generation);
       RCLCPP_INFO(get_logger(), "[%s] Egress bound: %s (%s, qos=%s/%s) -> %s",
@@ -1265,18 +1321,18 @@ void ZenohBridgeNode::attachEgressRosSubscriptions() {
       addLog("INFO", "Egress bound: " + topic + " (" + type + ", qos=" + reliability + "/" +
                          durability + ") -> " + eg->zenoh_key);
     } catch (const std::exception &e) {
-      {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        eg->last_error = e.what();
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (eg->active.load() && eg->binding_retry.failed(target, e.what())) {
+        const auto message = "Egress subscribe failed for " + target + ": " + e.what();
+        RCLCPP_ERROR(get_logger(), "%s", message.c_str());
+        addLog("ERROR", message, false);
       }
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                           "Could not subscribe to %s (%s): %s", topic.c_str(), type.c_str(), e.what());
-      addLog("ERROR", "Egress subscribe failed for " + topic + " (" + type + "): " + e.what());
     }
   }
 }
 
 void ZenohBridgeNode::onDiscoveryTimer() {
+  refreshDemandIngress();
   attachEgressRosSubscriptions();
 }
 
@@ -1330,16 +1386,61 @@ void ZenohBridgeNode::handleRosMessage(
   }
 }
 
+std::shared_ptr<ZenohBridgeNode::IngressEndpoint> ZenohBridgeNode::getOrCreateIngressEndpoint(
+    const std::shared_ptr<ActiveIngress> &ig, const std::string &topic,
+    const std::string &type, const std::string &source_qos) {
+  // Most samples already have a publisher. Take the node-wide ownership lock
+  // only when binding, in the same order as snapshotRulesLocked().
+  {
+    std::lock_guard<std::mutex> endpoints(ig->endpoints_mutex);
+    const auto found = ig->endpoints.find(topic);
+    if (found != ig->endpoints.end() && found->second->msg_type == type) return found->second;
+    const auto retry = ig->binding_retries.find(topic);
+    if (retry != ig->binding_retries.end() && !retry->second.ready(type)) return {};
+  }
+  std::lock_guard<std::mutex> state(state_mutex_);
+  std::lock_guard<std::mutex> endpoints(ig->endpoints_mutex);
+  if (!ig->active.load()) return {};
+  const auto found = ig->endpoints.find(topic);
+  if (found != ig->endpoints.end() && found->second->msg_type == type) return found->second;
+  auto &retry = ig->binding_retries[topic];
+  if (!retry.ready(type)) return {};
+  try {
+    auto ep = std::make_shared<IngressEndpoint>();
+    ep->local_topic = topic;
+    ep->msg_type = type;
+    ep->ros_pub = create_generic_publisher(topic, type,
+        buildPublisherQos(ig->rule.qos, source_qos, ig->rule.history_depth));
+    ig->endpoints[topic] = ep;
+    ingress_owned_topics_.insert(topic);
+    ig->binding_retries.erase(topic);
+    ig->last_error.clear();
+    const auto message = "Ingress created: " + topic + " (" + type + ")";
+    RCLCPP_INFO(get_logger(), "%s", message.c_str());
+    addLog("INFO", message);
+    return ep;
+  } catch (const std::exception &e) {
+    if (retry.failed(type, e.what())) {
+      const auto message = "Ingress publisher failed for " + topic + " (" + type + "): " + e.what();
+      RCLCPP_ERROR(get_logger(), "%s", message.c_str());
+      addLog("ERROR", message, false);
+    }
+    return {};
+  }
+}
+
 void ZenohBridgeNode::handleZenohSample(const std::shared_ptr<ActiveIngress> &ig,
-                                        const zenoh::Sample &sample) {
+                                        const zenoh::Sample &sample,
+                                        const std::shared_ptr<IngressEndpoint> &offered,
+                                        const std::string &offered_source) {
   if (!ig->active.load(std::memory_order_acquire)) {
     return;
   }
 
   const std::string full_key(sample.get_keyexpr().as_string_view());
-  std::string src_agent;
+  std::string src_agent = offered_source;
   std::string rel_topic;
-  if (!parseDataKey(ig->domain_prefix, full_key, src_agent, rel_topic)) {
+  if (!offered && !parseDataKey(ig->domain_prefix, full_key, src_agent, rel_topic)) {
     return;
   }
 
@@ -1362,57 +1463,14 @@ void ZenohBridgeNode::handleZenohSample(const std::shared_ptr<ActiveIngress> &ig
   if (ig->rule.exclude_self && src_agent == ig->agent_id) {
     return;
   }
-  if (msg_type.empty()) {
+  if (msg_type.empty() || (offered && (src_agent != offered_source || msg_type != offered->msg_type))) {
     return;
   }
 
-  const std::string local_topic = localIngressTopic(ig->rule, src_agent, rel_topic);
+  const std::string local_topic = offered ? offered->local_topic : localIngressTopic(ig->rule, src_agent, rel_topic);
 
-  std::shared_ptr<IngressEndpoint> ep;
-  {
-    std::lock_guard<std::mutex> lk(ig->endpoints_mutex);
-    auto it = ig->endpoints.find(local_topic);
-    if (it != ig->endpoints.end() && it->second->msg_type == msg_type) {
-      ep = it->second;
-    }
-  }
-
-  if (!ep) {
-    try {
-      {
-        std::lock_guard<std::mutex> lk(state_mutex_);
-        ingress_owned_topics_.insert(local_topic);
-      }
-      rclcpp::QoS pub_qos = buildPublisherQos(ig->rule.qos, att_qos, ig->rule.history_depth);
-      auto pub = this->create_generic_publisher(local_topic, msg_type, pub_qos);
-
-      auto new_ep = std::make_shared<IngressEndpoint>();
-      new_ep->local_topic = local_topic;
-      new_ep->msg_type = msg_type;
-      new_ep->ros_pub = std::move(pub);
-
-      std::lock_guard<std::mutex> lk(ig->endpoints_mutex);
-      auto &slot = ig->endpoints[local_topic];
-      if (!slot || slot->msg_type != msg_type) {
-        slot = new_ep;
-      }
-      ig->last_error.clear();
-      ep = slot;
-      RCLCPP_INFO(get_logger(), "[%s] Ingress created: %s -> %s (%s)",
-                  ig->agent_id.c_str(), full_key.c_str(), local_topic.c_str(), msg_type.c_str());
-      addLog("INFO", "Ingress created: " + full_key + " -> " + local_topic + " (" + msg_type + ")");
-    } catch (const std::exception &e) {
-      {
-        std::lock_guard<std::mutex> lk(ig->endpoints_mutex);
-        ig->last_error = std::string(msg_type) + ": " + e.what();
-      }
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                           "[%s] Failed to create ingress publisher %s (%s): %s",
-                           ig->agent_id.c_str(), local_topic.c_str(), msg_type.c_str(), e.what());
-      addLog("ERROR", "Ingress publisher failed for " + local_topic + " (" + msg_type + "): " + e.what());
-      return;
-    }
-  }
+  auto ep = offered ? offered : getOrCreateIngressEndpoint(ig, local_topic, msg_type, att_qos);
+  if (!ep) return;
 
   if (!passRateLimit(ep->last_rx_ns, ig->rule.max_freq)) {
     ig->dropped_count.fetch_add(1, std::memory_order_relaxed);
@@ -1689,7 +1747,10 @@ void ZenohBridgeNode::handleControlQuery(const zenoh::Query &query) {
       }
       std::string msg;
       const bool persist = (action == "apply_and_save");
-      const bool ok = applyRules(rs, persist, msg);
+      // A reconnect can be waiting for this inline query callback to finish.
+      std::unique_lock<std::mutex> writer(reconfigure_mutex_, std::try_to_lock);
+      if (!writer) throw std::runtime_error("Configuration change in progress; retry");
+      const bool ok = applyRulesLocked(rs, persist, msg);
       reply = nlohmann::json{
           {"ok", ok},
           {"message", msg},
@@ -1700,7 +1761,8 @@ void ZenohBridgeNode::handleControlQuery(const zenoh::Query &query) {
       if (rules_file_.empty()) {
         reply = nlohmann::json{{"ok", false}, {"message", "No rules_file configured"}};
       } else {
-        std::lock_guard<std::mutex> rules_lk(rules_mutex_);
+        std::unique_lock<std::mutex> writer(reconfigure_mutex_, std::try_to_lock);
+        if (!writer) throw std::runtime_error("Configuration change in progress; retry");
         saveRulesToYamlFile(rules_file_, getCurrentRules());
         reply = nlohmann::json{{"ok", true}, {"message", "Saved to " + rules_file_}, {"saved", true}};
       }
@@ -1863,6 +1925,7 @@ AgentStatus ZenohBridgeNode::buildStatusSnapshot(const RuntimeConfig &config) co
   readSessionIds(config.active_session, st);
 
   std::lock_guard<std::mutex> lk(state_mutex_);
+  st.allow_unprefixed_local = config.bridge.allow_unprefixed_local;
   st.local_topics = cached_local_topics_;
   auto rules = snapshotRulesLocked();
   st.egress = std::move(rules.egress);
@@ -1894,12 +1957,17 @@ HttpResponse ZenohBridgeNode::handleHttpRequest(const HttpRequest &req) {
         {"ok", true},
         {"local_agent_id", config->agent_id},
         {"default_agent_id", default_agent_id_},
+        {"dds_shield_token_required", req.shield_token_required},
+        {"dds_shield_management_available", req.shield_management_available},
         {"status", snap},
         {"bridge_settings", config->bridge},
         {"session_config", config->session},
         {"rules_file", rules_file_},
     });
   }
+
+  if (req.method == "GET" && path == "/config/export") return handleConfigTransfer(req, false);
+  if (req.method == "POST" && path == "/config/import") return handleConfigTransfer(req, true);
 
   if (req.method == "GET" && path == "/agents") {
     const int64_t now_ms = nowEpochMs();
@@ -1917,6 +1985,8 @@ HttpResponse ZenohBridgeNode::handleHttpRequest(const HttpRequest &req) {
         if (kv.first == config->agent_id) {
           // Empty is a policy (follow ROS_DOMAIN_ID); snapshot domains are the effective ports' domains.
           item["dds_shield_configured_domains"] = config->bridge.dds_shield_domains;
+          item["dds_shield_token_required"] = req.shield_token_required;
+          item["dds_shield_management_available"] = req.shield_management_available;
         }
         item["online"] = online;
         item["last_seen_ms"] = seen;
@@ -1924,6 +1994,12 @@ HttpResponse ZenohBridgeNode::handleHttpRequest(const HttpRequest &req) {
       }
     }
     return makeJson(200, {{"ok", true}, {"local_agent_id", config->agent_id}, {"agents", arr}});
+  }
+
+  if (path == "/zenoh/stream") {
+    if (req.method != "GET") return makeJson(405, {{"ok", false}, {"message", "Use GET for SSE"}});
+    auto it = req.query_params.find("key_expr");
+    return openTelemetryStream(it == req.query_params.end() ? "" : it->second);
   }
 
   if (req.method == "GET" && path == "/local/topics") {
@@ -2641,10 +2717,10 @@ nlohmann::json ZenohBridgeNode::handleSniffStopApi() {
   return {{"ok", true}};
 }
 
-void ZenohBridgeNode::addLog(const std::string &level, const std::string &message) {
+void ZenohBridgeNode::addLog(const std::string &level, const std::string &message, bool coalesce) {
   const int64_t now_ms = nowEpochMs();
   std::lock_guard<std::mutex> lk(log_mutex_);
-  if (!log_buffer_.empty() && message == log_buffer_.front().message &&
+  if (coalesce && !log_buffer_.empty() && message == log_buffer_.front().message &&
       now_ms - log_buffer_.front().timestamp_ms < 4000) {
     return;
   }

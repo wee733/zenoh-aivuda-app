@@ -18,6 +18,9 @@ find_package(Threads REQUIRED)
 
 add_executable(zenoh_bridge_node
   src/bridge_node.cpp
+  src/presence_stream.cpp
+  src/config_transfer.cpp
+  src/demand_ingress.cpp
   src/main.cpp
 )
 

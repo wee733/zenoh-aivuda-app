@@ -126,6 +126,24 @@ def checked_status(records, expected):
     # normalizing handles, counter values and equivalent port membership syntax.
     counts = {hook: [0, 0] for hook in ('input', 'output')}
 
+    def is_netbird_passthrough(obj):
+        exprs = obj.get('expr') or []
+        has_wt0 = False
+        has_accept = False
+        for expr in exprs:
+            if 'counter' in expr:
+                continue
+            if expr == {'accept': None}:
+                has_accept = True
+                continue
+            m = expr.get('match')
+            if (isinstance(m, dict) and m.get('op') == '==' and m.get('right') == 'wt0' and
+                    m.get('left') in ({'meta': {'key': 'iifname'}}, {'meta': {'key': 'oifname'}})):
+                has_wt0 = True
+                continue
+            return False
+        return has_wt0 and has_accept
+
     def shape(objects, kernel):
         definitions, rules = {}, {}
         for record in objects:
@@ -133,6 +151,8 @@ def checked_status(records, expected):
             obj = obj.copy()
             obj.pop('handle', None)
             if kind == 'rule':
+                if kernel and is_netbird_passthrough(obj):
+                    continue
                 chain = obj['chain']
                 for expr in obj['expr']:
                     if 'counter' in expr and kernel:

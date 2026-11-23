@@ -766,3 +766,17 @@ html, body {
   border-color: var(--border);
   color: var(--text-muted);
 }
+
+.config-dialog {
+  width: min(440px, calc(100vw - 32px));
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  background: var(--bg-elev);
+  padding: 20px;
+}
+.config-dialog::backdrop { background: rgb(0 0 0 / 65%); }
+.config-dialog h2 { margin: 0; font-size: 18px; }
+.config-dialog p { white-space: pre-line; overflow-wrap: anywhere; line-height: 1.6; }
+.config-dialog fieldset { display: grid; gap: 8px; border: 1px solid var(--border); }
+.config-dialog .btn-row { justify-content: flex-end; }

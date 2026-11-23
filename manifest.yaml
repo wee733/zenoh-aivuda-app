@@ -1,7 +1,7 @@
 app_id: zenoh
 name: Zenoh Bridge
 description: Official Eclipse Zenoh 1.8 C++ dynamic ROS 2 bridge with built-in DDS Shield anti-leak isolation and full Web UI management (JSON5 & visual kernel config, TLS/Auth/ACL/SHM/QoS/Routing, live links/scouting/liveliness, topic discovery, multi-agent remote control, and Zenoh Lab).
-version: 2.2.1
+version: 2.4.0
 run:
   entrypoint: ./start.sh
   args: []

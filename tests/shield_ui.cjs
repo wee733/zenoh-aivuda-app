@@ -16,21 +16,31 @@ test('polls merge drafts with current policy and writes never pin automatic doma
   }
   const writes = [];
   const agent = { agent_id: 'local', is_local: true, online: true, dds_shield_enabled: false,
+    dds_shield_token_required: true, dds_shield_management_available: true,
     dds_shield_active: false, dds_shield_scope: 'domain', dds_shield_configured_domains: '', dds_shield_domains: '7' };
   let infoReads = 0;
+  let serveHtml = false;
+  let lastHeaders;
+  const page = { location: { href: 'https://example.invalid/app_zenoh_2026042116_ba01/ui/' }, isSecureContext: false };
   async function fetch(url, options) {
+    assert.ok(url.startsWith('/zenoh/api/'), url);
+    assert.equal(options.cache, 'no-store', 'an API URL can already have a cached HTML fallback');
+    if (serveHtml && url.endsWith('/agents')) return new Response('<html></html>', {
+      headers: { 'Content-Type': 'text/html' },
+    });
     if (url.includes('/zenoh/info?')) {
       ++infoReads;
       return { ok: true, json: async () => ({ ok: true, zid: 'test-zid' }) };
     }
     if (url.endsWith('/agents')) return { ok: true, json: async () => ({ ok: true, local_agent_id: 'local', agents: [{ ...agent }] }) };
     assert.ok(url.endsWith('/dds_shield'));
+    lastHeaders = options.headers;
     writes.push(JSON.parse(options.body));
     return { ok: true, json: async () => ({ ok: true }) };
   }
   vm.runInNewContext(fs.readFileSync(require.resolve('../ui/app.js'), 'utf8'), {
     document: { getElementById: element, createElement: id => element(id), querySelectorAll: () => [] },
-    URL, AbortController, window: { location: { href: 'https://example.invalid/bridge/ui/' }, isSecureContext: true },
+    URL, AbortController, window: page,
     fetch, setTimeout() {}, clearTimeout() {}, setInterval() {},
   });
   const click = async id => element(id).handlers.click();
@@ -43,6 +53,7 @@ test('polls merge drafts with current policy and writes never pin automatic doma
   element('coreShieldEnabled').checked = true;
   element('shieldToken').value = 'test';
   await click('btnCoreShieldApply');
+  assert.equal(lastHeaders['X-DDS-Shield-Token'], 'test');
   assert.deepEqual(writes.pop(), { agent_id: 'local', enabled: true, save: true,
     expected_policy: { enabled: false, scope: 'domain', domains: '' } });
 
@@ -68,4 +79,34 @@ test('polls merge drafts with current policy and writes never pin automatic doma
   await click('btnDdsShieldPill');
   assert.deepEqual(writes.pop(), { agent_id: 'local', enabled: false, save: true,
     expected_policy: { enabled: true, scope: 'domain', domains: '12' } });
+  page.location.href = 'http://127.0.0.1/zenoh/ui/';
+  agent.dds_shield_token_required = false;
+  await poll();
+  assert.equal(element('shieldToken').hidden, true);
+  assert.equal(element('btnCoreShieldApply').disabled, false);
+  await click('btnCoreShieldApply');
+  assert.equal(lastHeaders['X-DDS-Shield-Token'], undefined);
+  assert.equal(writes.pop().agent_id, 'local');
+
+  page.location.href = 'http://192.0.2.1/app_zenoh_2026042116_ba01/ui/';
+  page.parent = { location: { origin: 'http://192.0.2.1' } };
+  agent.dds_shield_token_required = true;
+  await poll();
+  assert.equal(element('btnCoreShieldApply').disabled, false);
+  assert.equal(element('shieldToken').hidden, false);
+  assert.match(element('coreShieldStatus').textContent, /ZENOH_BRIDGE_SHIELD_TOKEN/);
+
+  agent.is_local = false;
+  await poll();
+  assert.equal(element('btnCoreShieldApply').disabled, true);
+  assert.match(element('coreShieldStatus').textContent, /远端只读/);
+  agent.is_local = true;
+  agent.online = false;
+  await poll();
+  assert.equal(element('btnCoreShieldApply').disabled, true);
+  assert.match(element('coreShieldStatus').textContent, /离线/);
+
+  serveHtml = true;
+  await poll();
+  assert.match(element('localSummary').textContent, /\/zenoh\/api\/agents.*HTTP 200.*JSON.*text\/html/);
 });

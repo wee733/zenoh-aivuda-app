@@ -5,6 +5,9 @@ sys:
 ros:
   distro: auto
   setup_script: ""
+  extra_overlay_setup_scripts: []
   discovery_range: LOCALHOST
 zenoh:
   ros_domain_id: -1
+  heartbeat_enabled: true
+  comm_status_enabled: true

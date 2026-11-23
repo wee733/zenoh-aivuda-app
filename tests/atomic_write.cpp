@@ -1,5 +1,5 @@
 // Linux: c++ -std=c++17 -Isrc/include tests/atomic_write.cpp -Wl,--wrap=fsync -o /tmp/test-atomic && /tmp/test-atomic
-#include "zenoh_bridge/protocol.hpp"
+#include "zenoh_bridge/config_transaction.hpp"
 
 #include <cassert>
 #include <filesystem>
@@ -46,6 +46,26 @@ int main() {
     if (fault != 1) assert(observations.back() == "dir:new");
     assert(current() == (fault == 1 ? "old" : "new"));
     assert(std::distance(fs::directory_iterator(dir), fs::directory_iterator{}) == 1);
+  }
+  const zenoh_bridge::ConfigFiles paths{{"bridge_settings", path}, {"routes", std::string(dir) + "/routes"}};
+  const auto journal = path + ".import-journal";
+  // Both fsyncs for the journal, each atomic file replacement, and the
+  // directory sync after unlinking the journal must have consistent rollback.
+  for (int fault = 0; fault <= 7; ++fault) {
+    std::ofstream(path) << "old settings";
+    std::ofstream(paths.at("routes")) << "old routes";
+    observations.clear();
+    fail_at = fault;
+    bool threw = false;
+    try {
+      zenoh_bridge::commitConfigFiles(paths, {{"bridge_settings", "new settings"}, {"routes", "new routes"}});
+    } catch (const std::runtime_error &) { threw = true; }
+    assert(threw == (fault != 0));
+    assert(!fs::exists(journal));
+    assert(current() == (fault == 0 ? "new settings" : "old settings"));
+    std::ifstream routes(paths.at("routes"));
+    std::string contents{std::istreambuf_iterator<char>(routes), {}};
+    assert(contents == (fault == 0 ? "new routes" : "old routes"));
   }
   fs::remove_all(dir);
 }

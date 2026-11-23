@@ -56,14 +56,16 @@ agent_id = custom_agent_id if custom_agent_id else default_agent_id
 
 ros_distro = str(ros_cfg.get("distro", "auto") or "auto").strip()
 ros_setup_script = str(ros_cfg.get("setup_script", "") or "").strip()
+overlays = ros_cfg.get("extra_overlay_setup_scripts", [])
+if not isinstance(overlays, list) or any(not isinstance(p, str) or not p.strip() for p in overlays):
+    raise ValueError("ros.extra_overlay_setup_scripts must be a list of non-empty file paths")
+overlay_paths = [Path(p).expanduser() for p in overlays]
+for path in overlay_paths:
+    if not path.is_absolute() or not path.is_file():
+        raise ValueError(f"Missing or non-absolute ROS overlay setup script: {path}")
 discovery_range = str(ros_cfg.get("discovery_range", "LOCALHOST") or "LOCALHOST").strip()
 zenoh_cfg = cfg.get("zenoh", {}) or {}
-if isinstance(zenoh_cfg, dict) and "ros_domain_id" in zenoh_cfg:
-    domain_id = int(zenoh_cfg.get("ros_domain_id", -1))
-elif "domain_id" in ros_cfg:
-    domain_id = int(ros_cfg.get("domain_id", -1))
-else:
-    domain_id = -1
+domain_id = int(zenoh_cfg.get("ros_domain_id", -1))
 
 runtime_payload = {
     "default_agent_id": default_agent_id,
@@ -72,6 +74,8 @@ runtime_payload = {
     "ros_domain_id": domain_id,
     "api_bind_host": "127.0.0.1",
     "api_port": 17447,
+    "heartbeat_enabled": zenoh_cfg.get("heartbeat_enabled", True),
+    "comm_status_enabled": zenoh_cfg.get("comm_status_enabled", True),
     "rules_file": str(Path(runtime_dir) / "routes.yaml"),
     "session_override_file": str(Path(runtime_dir) / "session_override.json"),
     "bridge_settings_file": str(bridge_settings_path),
@@ -85,6 +89,7 @@ os.replace(tmp.name, runtime_json_path)
 lines = [
     f"ROS_CFG_DISTRO={quote(ros_distro)}",
     f"ROS_CFG_SETUP_SCRIPT={quote(ros_setup_script)}",
+    "ROS_EXTRA_OVERLAYS=(" + " ".join(quote(str(p)) for p in overlay_paths) + ")",
     f"ROS_CFG_DISCOVERY_RANGE={quote(discovery_range)}",
     f"ROS_CFG_DOMAIN_ID={quote(str(domain_id))}",
     f"ZENOH_AGENT_ID={quote(agent_id)}",
@@ -122,6 +127,13 @@ for overlay in \
   fi
 done
 
+for overlay in "${ROS_EXTRA_OVERLAYS[@]}"; do
+  echo "[start.sh] Sourcing configured ROS 2 overlay: ${overlay}"
+  set +u
+  source "${overlay}"
+  set -u
+done
+
 unset ROS_LOCALHOST_ONLY || true
 export ROS_AUTOMATIC_DISCOVERY_RANGE="${ROS_CFG_DISCOVERY_RANGE}"
 if [[ "${ROS_CFG_DOMAIN_ID}" -ge 0 ]]; then
@@ -134,5 +146,10 @@ if [[ ! -x "${BIN}" ]]; then
   bash "${APP_ROOT}/scripts/pre_install.sh"
 fi
 
+if [[ -n "${ZENOH_BRIDGE_SHIELD_TOKEN:-}" ]]; then
+  echo "[start.sh] DDS Shield uses the token set in the service environment (ZENOH_BRIDGE_SHIELD_TOKEN)"
+else
+  echo "[start.sh] DDS Shield allows token-free management from this machine through the loopback listener"
+fi
 echo "[start.sh] Launching zenoh_bridge_node (agent=${ZENOH_AGENT_ID}, discovery=${ROS_AUTOMATIC_DISCOVERY_RANGE})"
 exec "${BIN}" --ros-args -r "__ns:=/${ZENOH_AGENT_ID}" -p "runtime_config_file:=${RUNTIME_JSON}"

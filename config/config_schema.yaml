@@ -1,3 +1,5 @@
+x-ros-domain-migration:
+  section: zenoh
 type: object
 properties:
   sys:
@@ -44,6 +46,14 @@ properties:
         default: ""
         description: "Optional ROS 2 setup.bash override (empty uses /opt/ros/<distro>/setup.bash)."
         need_restart: true
+      extra_overlay_setup_scripts:
+        type: array
+        items:
+          type: string
+          minLength: 1
+        default: []
+        description: "Ordered paths to trusted ROS 2 workspace setup scripts for custom message types (absolute paths or ~/...)."
+        need_restart: true
       discovery_range:
         type: string
         enum:
@@ -53,12 +63,6 @@ properties:
         default: LOCALHOST
         description: "ROS 2 DDS discovery range (LOCALHOST isolates DDS on-device and routes inter-node traffic over Zenoh)."
         need_restart: true
-      domain_id:
-        type: integer
-        minimum: -1
-        maximum: 232
-        description: "Legacy 2.1 ROS domain; used only when zenoh.ros_domain_id is absent."
-        need_restart: true
     required:
       - distro
       - setup_script
@@ -67,12 +71,22 @@ properties:
   zenoh:
     type: object
     properties:
+      heartbeat_enabled:
+        type: boolean
+        default: true
+        description: "Publish local heartbeat at 2 Hz. Disable when the telemetry bridge owns this identity's heartbeat."
+        need_restart: true
+      comm_status_enabled:
+        type: boolean
+        default: true
+        description: "Report recently observed neighboring heartbeats at 2 Hz."
+        need_restart: true
       ros_domain_id:
         type: integer
         minimum: -1
         maximum: 232
         default: -1
-        description: "ROS_DOMAIN_ID for the bridge. When present, even -1 overrides legacy ros.domain_id; -1 inherits ROS_DOMAIN_ID from the environment (0 if unset)."
+        description: "ROS_DOMAIN_ID for the bridge. Use -1 to inherit the launch environment (0 if unset)."
         need_restart: true
     required:
       - ros_domain_id

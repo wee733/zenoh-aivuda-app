@@ -84,6 +84,8 @@ def check(binary, root):
                     return False
             eventually(ready, 12)
 
+            assert api('status')['dds_shield_token_required']
+            api('dds_shield', {'enabled': True}, extra_headers={'X-DDS-Shield-Token': 'incorrect'}, expected=403)
             # Empty configured domains must remain distinguishable from the running domain.
             local = next(a for a in api('agents')['agents'] if a['is_local'])
             assert (local['dds_shield_configured_domains'], local['dds_shield_domains']) == ('', '117')
@@ -218,7 +220,85 @@ def check(binary, root):
                     raise
 
 
+def token_free_check(binary, root, bind_host):
+    executable = stage_node(binary, root, HELPER)
+    with socket.socket() as http, socket.socket() as zenoh:
+        http.bind(('127.0.0.1', 0))
+        zenoh.bind(('127.0.0.1', 0))
+        port, zport = http.getsockname()[1], zenoh.getsockname()[1]
+    settings = root / 'settings.json'
+    runtime = root / 'runtime.json'
+    runtime.write_text(json.dumps({'agent_id': 'shield-test', 'api_bind_host': bind_host, 'api_port': port,
+                                   'bridge_settings_file': str(settings), 'session': session('b2', zport)}))
+    env = dict(os.environ, AIVUDA_APP_RUNTIME_DATA_PATH=str(root), ROS_DOMAIN_ID='117', ROS_HOME=str(root),
+               ROS_AUTOMATIC_DISCOVERY_RANGE='OFF', ROS_STATIC_PEERS='', AIVUDA_OS_AVAHI_HOSTNAME='fixture-uav')
+    env.pop('ZENOH_BRIDGE_SHIELD_TOKEN', None)
+    api = local_api(port, timeout=5)
+    with (root / 'node.log').open('w') as log:
+        proc = subprocess.Popen([executable, '--ros-args', '-p', f'runtime_config_file:={runtime}'],
+                                env=env, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            def ready():
+                assert proc.poll() is None, 'node exited'
+                try:
+                    return api('status')['ok']
+                except urllib.error.URLError:
+                    return False
+            eventually(ready, 12)
+            if bind_host != '127.0.0.1':
+                assert api('status')['dds_shield_token_required']
+                assert not api('status')['dds_shield_management_available']
+                api('dds_shield', {'enabled': True}, expected=403)
+                return
+            assert not api('status')['dds_shield_token_required']
+            local = next(a for a in api('agents')['agents'] if a['is_local'])
+            assert not local['dds_shield_token_required'] and local['dds_shield_management_available']
+            for headers in ({'Origin': 'https://elsewhere.invalid'}, {'Sec-Fetch-Site': 'cross-site'},
+                            {'Host': 'unrelated.invalid'}, {'X-Forwarded-For': '192.0.2.1'}):
+                api('dds_shield', {'enabled': True}, extra_headers=headers, expected=403)
+                api('bridge/settings', {'bridge_settings': {'dds_shield_enabled': True}},
+                    extra_headers=headers, expected=403)
+            api('dds_shield?agent_id=remote', {'enabled': True}, expected=403)
+            assert not settings.exists()
+            def proxy_headers(host, client, scheme='https'):
+                return {'Host': host, 'Origin': scheme + '://' + host, 'Sec-Fetch-Site': 'same-origin',
+                        'X-Forwarded-For': client, 'X-Forwarded-Host': host, 'X-Forwarded-Proto': scheme}
+
+            gateway = proxy_headers('localhost:8080', '127.0.0.1', 'http')
+            api('dds_shield', {'enabled': True}, extra_headers=gateway)
+            assert json.loads(settings.read_text())['dds_shield_enabled']
+            api('dds_shield', {'enabled': False})
+            assert not json.loads(settings.read_text())['dds_shield_enabled']
+
+            # Read numeric NIC addresses from the kernel. No external network or DNS is needed.
+            interfaces = json.loads(subprocess.check_output(['ip', '-j', 'addr', 'show', 'up']))
+            addresses = [addr['local'] for iface in interfaces for addr in iface.get('addr_info', [])
+                         if addr['scope'] == 'global' and addr['family'] in ('inet', 'inet6')]
+            alias = 'fixture-uav.local'
+            for client in ['::1', *addresses]:
+                via_alias = proxy_headers(alias, client)
+                assert api('status', extra_headers=via_alias)['dds_shield_management_available']
+                api('dds_shield', {'enabled': False}, extra_headers=via_alias)
+                host_ip = '[' + client + ']' if ':' in client else client
+                assert api('status', extra_headers=proxy_headers(host_ip, client))['dds_shield_management_available']
+                for change in ({'X-Forwarded-For': '192.0.2.44'}, {'X-Forwarded-For': client + ', ' + client},
+                               {'Origin': 'http://' + alias}, {'Sec-Fetch-Site': 'cross-site'},
+                               {'X-Forwarded-Host': 'other.invalid'}, {'X-Forwarded-Proto': 'unknown'}):
+                    api('dds_shield', {'enabled': True}, expected=403, extra_headers={**via_alias, **change})
+            api('dds_shield', {'enabled': True}, expected=403, extra_headers={'Host': alias})
+            assert not json.loads(settings.read_text())['dds_shield_enabled']
+            for route in ('config/export', 'config/import'):
+                api(route, {} if route.endswith('import') else None,
+                    extra_headers={'Origin': 'https://elsewhere.invalid'}, expected=403)
+        finally:
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=8)
+
+
 if __name__ == '__main__':
     with tempfile.TemporaryDirectory() as tmp:
         check(str(Path(sys.argv[1]).resolve(strict=True)), Path(tmp))
+    for bind_host in ('127.0.0.1', '0.0.0.0'):
+        with tempfile.TemporaryDirectory() as tmp:
+            token_free_check(str(Path(sys.argv[1]).resolve(strict=True)), Path(tmp), bind_host)
     print('PASS: local authorization, remote patches, validation, single apply, helper errors, rollback and status')
